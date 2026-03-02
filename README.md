@@ -35,7 +35,7 @@ Windows 系统的 C 盘强力清理工具，可扫描并清理 C 盘中的垃圾
 
 本项目使用 **Python + Fluent 2 Design** 编写，完全开源免费，面向 Windows 平台，支持常规垃圾清理、大文件扫描、重复文件查找、空文件夹清理、无效快捷方式清理及注册表清理等多种模式，同时提供 GUI 界面，每次启动时自动获取管理员权限、回收站/永久删除等功能，简单易操作，适合各种方面的用户使用。
 
-<img width="1682" height="969" alt="QQ_1772186747866" src="https://github.com/user-attachments/assets/866ccfb3-9295-4c97-9ec6-0c9a4248726c" />
+<img width="1682" height="969" alt="QQ_1772472271177" src="https://github.com/user-attachments/assets/13dbfd3c-58cb-45c7-b11e-4f57edc51743" />
 
 ---
 
