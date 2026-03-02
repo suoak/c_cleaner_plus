@@ -16,7 +16,7 @@ on:
       version_tag:
         description: '请输入你要发布的版本号 (例如: v0.2.4 或 v0.2.4-alpha)'
         required: true
-        default: 'v0.2.4-alpha'
+        default: 'v0.2.4'
 
 # 赋予 GitHub Action 创建 Release 和上传文件的权限
 permissions:
@@ -70,8 +70,7 @@ jobs:
         fi
         
         # 写入正式日志文件的 Markdown 标题
-        echo "### \`main.py\` 更新日志" > main_release_notes.txt
-        echo "" >> main_release_notes.txt
+        echo main_release_notes.txt
         
         # 过滤掉临时文件中的完全空白行，并将内容追加到正式日志中
         # 这样原生的 "- 新增xxx" 列表格式就会完美无缝地拼接在一起
