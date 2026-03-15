@@ -44,6 +44,23 @@ def resource_path(relative_path):
     if getattr(sys, '_MEIPASS', None): return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
 
+def format_exception_text(e):
+    return f"{type(e).__name__}: {e}"
+
+def log_background_error(context, e):
+    print(f"[{time.strftime('%H:%M:%S')}] [{context}] {format_exception_text(e)}", file=sys.stderr)
+
+def append_error_sample(errors, message, limit=8):
+    if len(errors) < limit:
+        errors.append(message)
+
+def emit_error_summary(log_fn, prefix, errors, total_count):
+    for msg in errors:
+        log_fn(f"[{prefix}] {msg}")
+    extra = max(0, int(total_count or 0) - len(errors))
+    if extra > 0:
+        log_fn(f"[{prefix}] 另有 {extra} 条异常未展开")
+
 def _normalize_version_text(version):
     if not version:
         return ""
@@ -495,6 +512,71 @@ def restore_default_explorer_associations(log_fn):
     except Exception as e:
         log_fn(f"[恢复关联] 失败: {e}")
         return False, f"恢复默认资源管理器关联失败: {e}"
+
+SYSTEM_CONTEXT_MENU_VERBS = {
+    "open", "opennewwindow", "openinnewprocess", "find", "runas", "cmd",
+    "powershell", "pintohome", "pintohomefromtree", "sharing", "share",
+    "properties", "includeinlibrary", "restorepreviousversions", "copyaspath",
+    "giveaccessto", "takeownership", "openinsandbox"
+}
+
+SYSTEM_CONTEXT_MENU_DLL_HINTS = (
+    "shell32.dll", "windows.storage.dll", "windows.ui.fileexplorer.dll",
+    "propsys.dll", "shdocvw.dll", "zipfldr.dll"
+)
+
+def _query_registry_default(root, subkey):
+    try:
+        with winreg.OpenKey(root, subkey) as key:
+            value, _ = winreg.QueryValueEx(key, "")
+            return str(value or "").strip()
+    except OSError:
+        return ""
+
+def _query_context_menu_source(target, sub_name):
+    shell_key = f"{target}\\{sub_name}"
+    command = _query_registry_default(winreg.HKEY_CLASSES_ROOT, shell_key + r"\command")
+    if command:
+        return command
+
+    clsid = _query_registry_default(winreg.HKEY_CLASSES_ROOT, shell_key)
+    if not clsid and re.fullmatch(r"\{[0-9a-fA-F\-]+\}", sub_name or ""):
+        clsid = sub_name
+    if clsid:
+        source = _query_registry_default(winreg.HKEY_CLASSES_ROOT, rf"CLSID\{clsid}\InprocServer32")
+        if source:
+            return source
+    return ""
+
+def classify_context_menu_entry(target, sub_name):
+    source = _query_context_menu_source(target, sub_name)
+    lower_name = str(sub_name or "").strip().lower()
+    lower_target = str(target or "").strip().lower()
+    lower_source = norm_path(source).lower()
+    system_root = os.environ.get("SystemRoot", r"C:\Windows").lower()
+
+    is_system = False
+    if lower_name in SYSTEM_CONTEXT_MENU_VERBS:
+        is_system = True
+    elif lower_source and lower_source.startswith(system_root):
+        is_system = True
+    elif any(hint in lower_source for hint in SYSTEM_CONTEXT_MENU_DLL_HINTS):
+        is_system = True
+    elif any(token in lower_target for token in ("directory\\shell", "folder\\shell", "drive\\shell")) and lower_name in {"open", "find", "runas"}:
+        is_system = True
+
+    if is_system:
+        category = "系统"
+        source_text = display_path(source) if source else "Windows 内置"
+    elif source:
+        category = "外部"
+        source_text = display_path(source)
+    else:
+        category = "未知"
+        source_text = "来源未识别"
+
+    detail = f"{target} | 来源: {source_text}"
+    return category, detail
     
 def kill_app_processes(install_dir, log_fn):
     """强力猎杀目标目录下的所有运行中进程、Windows服务 以及 内核驱动"""
@@ -2488,7 +2570,8 @@ class CleanPage(ScrollArea):
             payload = [serialize_rule_entry(t) for t in customs]
             payload = [t for t in payload if t is not None]
             with open(path, 'w', encoding='utf-8') as f: json.dump(payload, f, ensure_ascii=False, indent=2)
-        except: pass
+        except Exception as e:
+            log_background_error("保存自定义规则失败", e)
 
     def do_add_rule(self):
         w = AddRuleDialog(self.window())
@@ -2984,6 +3067,8 @@ class UninstallPage(ScrollArea):
     def _scan_w(self):
         t0 = time.time()
         software = []
+        scan_errors = []
+        error_count = 0
         keys = [(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
                 (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall")]
@@ -3003,7 +3088,7 @@ class UninstallPage(ScrollArea):
                             if disp:
                                 def get_val(name):
                                     try: return winreg.QueryValueEx(sub_key, name)[0]
-                                    except: return ""
+                                    except OSError: return ""
                                     
                                 ver = get_val("DisplayVersion")
                                 pub = get_val("Publisher")
@@ -3031,15 +3116,18 @@ class UninstallPage(ScrollArea):
                                     "risk_kind": meta["risk_kind"],
                                     "risk_reason": meta["risk_reason"]
                                 })
-                        except: 
-                            pass
+                        except Exception as e:
+                            error_count += 1
+                            append_error_sample(scan_errors, f"{subkey_str}\\{sub_name} -> {format_exception_text(e)}")
                         finally: 
                             winreg.CloseKey(sub_key)
-                    except: 
-                        pass
+                    except Exception as e:
+                        error_count += 1
+                        append_error_sample(scan_errors, f"{subkey_str} 第 {i + 1} 项读取失败 -> {format_exception_text(e)}")
                 winreg.CloseKey(key)
-            except: 
-                pass
+            except Exception as e:
+                error_count += 1
+                append_error_sample(scan_errors, f"{subkey_str} 无法打开 -> {format_exception_text(e)}")
         
         seen = set()
         unique = []
@@ -3060,6 +3148,8 @@ class UninstallPage(ScrollArea):
                 user_count += 1
             self.sig.uninst_add.emit(item)
 
+        if error_count:
+            emit_error_summary(self.sig.uninst_log.emit, "扫描异常", scan_errors, error_count)
         self.sig.uninst_done.emit(f"成功扫描出 {len(unique)} 个软件（用户 {user_count}，系统 {system_count}），耗时 {time.time()-t0:.1f} 秒")
 
     def _get_checked_rows_data(self):
@@ -3878,6 +3968,8 @@ class MoreCleanPage(ScrollArea):
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
             (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall")]
+        scan_errors = []
+        error_count = 0
         for hkey, subkey_str in keys_to_check:
             try:
                 key = winreg.OpenKey(hkey, subkey_str)
@@ -3893,20 +3985,29 @@ class MoreCleanPage(ScrollArea):
                                 except OSError:
                                     disp_name = sub_name
                                 res.append(("无效卸载项", disp_name, "原目录已丢失", f"{'HKLM' if hkey==winreg.HKEY_LOCAL_MACHINE else 'HKCU'}\\{subkey_str}\\{sub_name}"))
-                        except OSError: pass
+                        except OSError:
+                            pass
                         winreg.CloseKey(sub_key)
-                    except OSError: pass
+                    except OSError as e:
+                        error_count += 1
+                        append_error_sample(scan_errors, f"{subkey_str} 第 {i + 1} 项读取失败 -> {format_exception_text(e)}")
                 winreg.CloseKey(key)
-            except OSError: pass
+            except OSError as e:
+                error_count += 1
+                append_error_sample(scan_errors, f"{subkey_str} 无法打开 -> {format_exception_text(e)}")
         if self.stop.is_set():
             self.sig.more_done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
+        if error_count:
+            emit_error_summary(self.sig.more_log.emit, "注册表扫描异常", scan_errors, error_count)
         for tp, nm, det, path in res: self.sig.more_add.emit(False, tp, nm, det, path)
         self.sig.more_done.emit(f"扫描完成，找到 {len(res)} 个无效注册表卸载项，耗时 {time.time()-t0:.1f} 秒")
 
     def _scan_context_menu(self):
         t0 = time.time()
         res = []; targets = [r"*\shell", r"*\shellex\ContextMenuHandlers", r"Directory\shell", r"Directory\Background\shell", r"Folder\shell", r"Folder\shellex\ContextMenuHandlers"]
+        scan_errors = []
+        error_count = 0
         for t in targets:
             try:
                 key = winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, t)
@@ -3914,15 +4015,27 @@ class MoreCleanPage(ScrollArea):
                     if self.stop.is_set(): break
                     try:
                         sub_name = winreg.EnumKey(key, i)
-                        res.append(("右键扩展", sub_name, t, f"HKCR\\{t}\\{sub_name}"))
-                    except: pass
+                        category, detail = classify_context_menu_entry(t, sub_name)
+                        res.append((category, sub_name, detail, f"HKCR\\{t}\\{sub_name}"))
+                    except Exception as e:
+                        error_count += 1
+                        append_error_sample(scan_errors, f"{t} 第 {i + 1} 项读取失败 -> {format_exception_text(e)}")
                 winreg.CloseKey(key)
-            except: pass
+            except Exception as e:
+                error_count += 1
+                append_error_sample(scan_errors, f"{t} 无法打开 -> {format_exception_text(e)}")
         if self.stop.is_set():
             self.sig.more_done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
+        if error_count:
+            emit_error_summary(self.sig.more_log.emit, "右键菜单扫描异常", scan_errors, error_count)
+        system_count = sum(1 for tp, _, _, _ in res if tp == "系统")
+        third_party_count = sum(1 for tp, _, _, _ in res if tp == "外部")
+        unknown_count = sum(1 for tp, _, _, _ in res if tp == "未知")
         for tp, nm, det, path in res: self.sig.more_add.emit(False, tp, nm, det, path)
-        self.sig.more_done.emit(f"扫描完成，列出 {len(res)} 个右键菜单扩展，耗时 {time.time()-t0:.1f} 秒")
+        self.sig.more_done.emit(
+            f"扫描完成，列出 {len(res)} 个右键菜单扩展（系统 {system_count}，第三方 {third_party_count}，未知 {unknown_count}），耗时 {time.time()-t0:.1f} 秒"
+        )
 
     def do_restore_default_associations(self):
         content = (
@@ -3945,7 +4058,8 @@ class MoreCleanPage(ScrollArea):
         self.sig.update_status.emit(level, title, msg)
 
     def do_del(self):
-        paths=[self.tbl.item(r,4).text() for r in range(self.tbl.rowCount()) if is_row_checked(self.tbl, r)]
+        selected_rows = [r for r in range(self.tbl.rowCount()) if is_row_checked(self.tbl, r)]
+        paths=[self.tbl.item(r,4).text() for r in selected_rows]
         if not paths: return
         mode_idx = self.cb_mode.currentIndex()
         is_reg = mode_idx in (3, 4)
@@ -3976,6 +4090,25 @@ class MoreCleanPage(ScrollArea):
 
             if not paths:
                 return
+
+        if mode_idx == 4:
+            system_items = []
+            for r in selected_rows:
+                type_item = self.tbl.item(r, 1)
+                name_item = self.tbl.item(r, 2)
+                if type_item and type_item.text() == "系统":
+                    system_items.append(name_item.text() if name_item else "")
+            if system_items:
+                preview = [f"- {name}" for name in system_items[:8] if name]
+                if len(system_items) > 8:
+                    preview.append(f"- 另有 {len(system_items) - 8} 项未展开")
+                content = (
+                    "当前勾选项中包含系统右键菜单项：\n\n"
+                    + "\n".join(preview)
+                    + "\n\n删除这些项目可能导致文件夹、目录、磁盘或资源管理器默认操作异常。是否仍要继续？"
+                )
+                if not MessageBox("风险确认", content, self.window()).exec():
+                    return
 
         if not MessageBox("确认",f"确定清理这 {len(paths)} 个项目？不可恢复",self.window()).exec(): return
         self.stop.clear()
@@ -4038,7 +4171,8 @@ class MainWindow(FluentWindow):
             try:
                 with open(self.global_settings_path, "r", encoding="utf-8") as f:
                     self.global_settings.update(json.load(f))
-            except: pass
+            except Exception as e:
+                log_background_error("加载全局设置失败", e)
 
         self.targets = [parse_rule_entry(t) for t in default_clean_targets()]
         self.targets = [t for t in self.targets if t]
@@ -4059,7 +4193,8 @@ class MainWindow(FluentWindow):
                     parsed = parse_rule_entry(c, force_custom=True)
                     if parsed:
                         self.targets.append(parsed)
-            except: pass
+            except Exception as e:
+                log_background_error("加载自定义规则失败", e)
 
         # 3. 恢复排序与勾选状态
         if os.path.exists(self.config_path):
@@ -4087,7 +4222,8 @@ class MainWindow(FluentWindow):
                     nm, pa, tp, en, nt, is_c, pattern = self.targets[i]
                     if nm in states:
                         self.targets[i] = (nm, pa, tp, states[nm], nt, is_c, pattern)
-            except: pass
+            except Exception as e:
+                log_background_error("加载排序与勾选状态失败", e)
                 
         self.clean_stop = threading.Event(); self.uninstall_stop = threading.Event(); self.big_stop = threading.Event(); self.more_stop = threading.Event(); self.sig = Sig()
         self.pg_clean = CleanPage(self.sig, self.targets, self.clean_stop, self)
@@ -4116,8 +4252,8 @@ class MainWindow(FluentWindow):
                 cfg_dir = data.get("config_dir", "")
                 if cfg_dir:
                     return os.path.abspath(os.path.expandvars(cfg_dir))
-        except:
-            pass
+        except Exception as e:
+            log_background_error("加载配置目录失败", e)
         return default_dir
 
     def _save_config_locator(self):
@@ -4243,8 +4379,8 @@ class MainWindow(FluentWindow):
             os.makedirs(self.config_dir, exist_ok=True)
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump({"order": order, "states": states}, f, ensure_ascii=False, indent=2)
-        except:
-            pass
+        except Exception as e:
+            log_background_error("保存排序状态失败", e)
 
     def set_config_dir(self, new_dir):
         import shutil
@@ -4268,8 +4404,8 @@ class MainWindow(FluentWindow):
                 self.pg_clean.save_custom_rules()
             if self.global_settings.get("auto_save", True) and hasattr(self, "pg_clean"):
                 self.save_order_state()
-        except:
-            pass
+        except Exception as e:
+            log_background_error("切换配置目录前保存当前配置失败", e)
 
         new_global = os.path.join(target_dir, "cdisk_cleaner_global_settings.json")
         new_custom = os.path.join(target_dir, "cdisk_cleaner_custom_rules.json")
@@ -4297,7 +4433,8 @@ class MainWindow(FluentWindow):
             os.makedirs(self.config_dir, exist_ok=True)
             with open(self.global_settings_path, "w", encoding="utf-8") as f:
                 json.dump(self.global_settings, f, ensure_ascii=False, indent=2)
-        except: pass
+        except Exception as e:
+            log_background_error("保存全局设置失败", e)
 
     def import_rules_from_path(self, path, source_name="规则集"):
         if hasattr(self, "pg_clean") and self.pg_clean.import_rules_from_path(path, source_name):
@@ -4308,7 +4445,8 @@ class MainWindow(FluentWindow):
             try:
                 self.pg_clean.save_custom_rules()
                 self.save_order_state()
-            except: pass
+            except Exception as e:
+                log_background_error("关闭窗口时自动保存失败", e)
         super().closeEvent(event)
 
     def _init_nav(self):
@@ -4510,7 +4648,15 @@ class MainWindow(FluentWindow):
 
     def _madd(self, chk, tp, nm, det, pa):
         t=self.pg_more.tbl; r=t.rowCount(); t.setRowCount(r+1)
-        t.setItem(r, 0, make_check_item(chk)); t.setItem(r, 1, QTableWidgetItem(tp)); t.setItem(r, 2, QTableWidgetItem(nm))
+        type_item = QTableWidgetItem(tp)
+        type_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        if tp == "系统":
+            type_item.setForeground(QColor(196, 92, 32))
+        elif tp == "外部":
+            type_item.setForeground(QColor(0, 120, 215) if not isDarkTheme() else QColor(120, 180, 255))
+        elif tp == "未知":
+            type_item.setForeground(QColor(180, 120, 0))
+        t.setItem(r, 0, make_check_item(chk)); t.setItem(r, 1, type_item); t.setItem(r, 2, QTableWidgetItem(nm))
         t.setItem(r, 3, QTableWidgetItem(det)); t.setItem(r, 4, QTableWidgetItem(pa))
 
     def _uadd(self, item): 
