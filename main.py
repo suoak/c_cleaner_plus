@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-C盘强力清理工具 v0.3.2
+C盘强力清理工具 v0.3.4
 PySide6 + PySide6-Fluent-Widgets (Fluent2 UI)
-包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式
+包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式等
 """
 
-import os, sys, time, ctypes, threading, subprocess, queue, json, hashlib, winreg, re, heapq
+import os, sys, time, ctypes, threading, subprocess, queue, json, hashlib, winreg, re, heapq, tempfile
 import urllib.request
 import webbrowser
 from collections import defaultdict
@@ -35,7 +35,7 @@ from qfluentwidgets import (
 # ══════════════════════════════════════════════════════════
 #  版本与更新配置
 # ══════════════════════════════════════════════════════════
-CURRENT_VERSION = "0.3.2"
+CURRENT_VERSION = "0.3.4"
 UPDATE_JSON_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/update.json"
 
 from qfluentwidgets.components.widgets.table_view import TableItemDelegate
@@ -91,6 +91,39 @@ def emit_error_summary(log_fn, prefix, errors, total_count):
     extra = max(0, int(total_count or 0) - len(errors))
     if extra > 0:
         log_fn(f"[{prefix}] 另有 {extra} 条异常未展开")
+
+def write_text_file_atomic(path, text, encoding="utf-8"):
+    target = os.path.abspath(os.path.expandvars(path))
+    parent = os.path.dirname(target)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    fd = None
+    tmp_path = ""
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".tmp", dir=parent or None, text=True)
+        with os.fdopen(fd, "w", encoding=encoding, newline="") as f:
+            fd = None
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, target)
+    except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+
+def write_json_file_atomic(path, payload, ensure_ascii=False, indent=2):
+    text = json.dumps(payload, ensure_ascii=ensure_ascii, indent=indent)
+    write_text_file_atomic(path, text, encoding="utf-8")
 
 def _normalize_version_text(version):
     if not version:
@@ -1457,6 +1490,88 @@ SYSTEM_IMPACT_PUBLISHER_KEYWORDS = (
     "bitdefender", "symantec", "mcafee", "vmware", "virtualbox"
 )
 
+UNINSTALL_PROTECTION_BLOCK_KEYWORDS = (
+    "bitlocker", "manage-bde", "fvevol", "fvenotify", "fveapi",
+    "trusted platform module", "trustedplatformmodule", "tpm",
+    "device encryption", "disk encryption"
+)
+
+UNINSTALL_PROTECTION_HIGH_KEYWORDS = (
+    "rapid storage", "intel rst", "storage controller", "storage filter",
+    "nvme", "encryption", "encrypt", "firmware", "secure boot",
+    "security", "protector"
+)
+
+UNINSTALL_PROTECTION_DRIVER_PATH_HINTS = (
+    r"\windows\system32\drivers",
+    r"\windows\system32\driverstore",
+    r"\windows\system32\drivers\etc",
+    r"\efi\\",
+)
+
+UNINSTALL_PROTECTION_SERVICE_REG_HINT = r"\system\currentcontrolset\services\\"
+
+def _contains_any_keyword(text, keywords):
+    blob = str(text or "").lower()
+    return any(keyword in blob for keyword in keywords if keyword)
+
+def classify_uninstall_leftover(item_kind, name="", path="", detail="", source="explicit", service_kind=""):
+    name_text = str(name or "").strip()
+    path_text = str(path or "").strip()
+    detail_text = str(detail or "").strip()
+    source_text = str(source or "explicit").strip().lower() or "explicit"
+    service_kind_text = str(service_kind or "").strip()
+
+    norm_text = norm_path(path_text)
+    lower_path = (norm_text or path_text).lower().replace("/", "\\")
+    blob = " ".join([
+        str(item_kind or ""),
+        name_text,
+        path_text,
+        detail_text,
+        service_kind_text
+    ]).lower()
+
+    has_block_keyword = _contains_any_keyword(blob, UNINSTALL_PROTECTION_BLOCK_KEYWORDS)
+    has_high_keyword = _contains_any_keyword(blob, UNINSTALL_PROTECTION_HIGH_KEYWORDS)
+    is_driver_service = "驱动" in service_kind_text or "driver" in blob
+    is_system_driver_path = any(token in lower_path for token in UNINSTALL_PROTECTION_DRIVER_PATH_HINTS)
+    is_service_reg = UNINSTALL_PROTECTION_SERVICE_REG_HINT in lower_path
+
+    if has_block_keyword:
+        return {
+            "tier": "blocked",
+            "default_checked": False,
+            "reason": "命中 BitLocker、TPM 或磁盘加密相关关键字，已禁止强力删除"
+        }
+
+    if has_high_keyword and (is_driver_service or is_system_driver_path or is_service_reg):
+        return {
+            "tier": "blocked",
+            "default_checked": False,
+            "reason": "命中存储驱动、固件或系统驱动敏感区域，已禁止强力删除"
+        }
+
+    if source_text == "keyword":
+        return {
+            "tier": "high",
+            "default_checked": False,
+            "reason": "该项来自关键词推断，可能是共享目录或共享注册表项，默认未勾选"
+        }
+
+    if has_high_keyword:
+        return {
+            "tier": "high",
+            "default_checked": False,
+            "reason": "命中存储、加密、固件或安全相关关键字，请确认确实属于目标软件"
+        }
+
+    return {
+        "tier": "normal",
+        "default_checked": True,
+        "reason": ""
+    }
+
 def classify_uninstall_entry(name, publisher, install_location, reg_path):
     name_text = str(name or "").strip()
     publisher_text = str(publisher or "").strip()
@@ -1467,6 +1582,7 @@ def classify_uninstall_entry(name, publisher, install_location, reg_path):
     publisher_lower = publisher_text.lower()
     path_lower = path_text.lower()
     reg_lower = reg_text.lower()
+    risk_blob = " ".join([name_lower, publisher_lower, path_lower, reg_lower])
 
     system_root = os.environ.get("SystemRoot", r"C:\Windows").lower()
     system_path_prefixes = (
@@ -1478,6 +1594,14 @@ def classify_uninstall_entry(name, publisher, install_location, reg_path):
         os.path.join(system_root, "installer").lower(),
         os.path.join(system_root, "driverstore").lower(),
     )
+
+    if _contains_any_keyword(risk_blob, UNINSTALL_PROTECTION_BLOCK_KEYWORDS):
+        return {
+            "category": "系统",
+            "is_risky": True,
+            "risk_kind": "critical",
+            "risk_reason": "疑似 BitLocker、TPM 或磁盘加密相关组件，强力卸载已拦截"
+        }
 
     is_windows_path = bool(path_lower) and any(path_lower.startswith(prefix) for prefix in system_path_prefixes)
     is_kb_update = bool(re.search(r"(^|[\s_(])kb\d{4,}", name_lower)) or bool(re.search(r"\\kb\d{4,}$", reg_lower))
@@ -2426,11 +2550,12 @@ class SettingPage(ScrollArea):
         if w.exec():
             try:
                 # 重置 targets 列表
-                self.main_win.targets.clear()
-                defaults = [parse_rule_entry(t) for t in default_clean_targets()]
-                defaults = [t for t in defaults if t]
-                self.main_win.targets.extend(defaults)
-                self.main_win.builtin_rule_keys = {make_rule_key(t[0], t[1], t[2], t[6]) for t in defaults}
+                with self.main_win._targets_lock:
+                    self.main_win.targets.clear()
+                    defaults = [parse_rule_entry(t) for t in default_clean_targets()]
+                    defaults = [t for t in defaults if t]
+                    self.main_win.targets.extend(defaults)
+                    self.main_win.builtin_rule_keys = {make_rule_key(t[0], t[1], t[2], t[6]) for t in defaults}
                 
                 # 重绘常规清理表格
                 self.main_win.pg_clean.reload_table()
@@ -2453,8 +2578,8 @@ class SettingPage(ScrollArea):
 #  页面：常规清理
 # ══════════════════════════════════════════════════════════
 class CleanPage(ScrollArea):
-    def __init__(self, sig, targets, stop, parent=None):
-        super().__init__(parent); self.sig=sig; self.targets=targets; self.stop=stop
+    def __init__(self, sig, targets, stop, targets_lock, parent=None):
+        super().__init__(parent); self.sig=sig; self.targets=targets; self.stop=stop; self._targets_lock=targets_lock
         self.estimated_sizes = {}
         self.view=QWidget(); self.setWidget(self.view); self.setWidgetResizable(True); self.setObjectName("cleanPage"); self.enableTransparentBackground()
         v=QVBoxLayout(self.view); v.setContentsMargins(28,12,28,20); v.setSpacing(8)
@@ -2544,7 +2669,8 @@ class CleanPage(ScrollArea):
         return make_rule_key(nm, pa, tp, pattern)
 
     def _get_display_entries(self):
-        items = list(enumerate(self.targets))
+        with self._targets_lock:
+            items = list(enumerate(self.targets))
         mode = self.cb_sort.currentIndex() if hasattr(self, "cb_sort") else 0
         if mode == 1:
             items.sort(key=lambda x: str(parse_rule_entry(x[1])[0]).lower())
@@ -2587,26 +2713,32 @@ class CleanPage(ScrollArea):
 
     def _sync(self):
         new_targets = []
+        indexed_updates = []
         mode = self.cb_sort.currentIndex() if hasattr(self, "cb_sort") else 0
         for r in range(self.tbl.rowCount()):
             name_item = self.tbl.item(r, 1)
             if not name_item: continue
-            
+
             user_data = name_item.data(Qt.ItemDataRole.UserRole)
             if user_data:
                 src_idx, nm, pa, tp, is_c, pattern = user_data
             else: continue
-                
+
             en = is_row_checked(self.tbl, r)
             nt = self.tbl.item(r, 3).text() if self.tbl.item(r, 3) else ""
             new_entry = (nm, pa, tp, en, nt, is_c, normalize_rule_pattern(tp, pattern, nt))
             if mode == 0:
                 new_targets.append(new_entry)
-            elif 0 <= src_idx < len(self.targets):
-                self.targets[src_idx] = new_entry
-        
-        if mode == 0 and new_targets:
-            self.targets[:] = new_targets
+            else:
+                indexed_updates.append((src_idx, new_entry))
+
+        with self._targets_lock:
+            if mode == 0 and new_targets:
+                self.targets[:] = new_targets
+            else:
+                for src_idx, entry in indexed_updates:
+                    if 0 <= src_idx < len(self.targets):
+                        self.targets[src_idx] = entry
 
     def _try_rst(self):
         if not getattr(self, 'chk_rst', None) or not self.chk_rst.isChecked(): return
@@ -2625,14 +2757,14 @@ class CleanPage(ScrollArea):
             self.sig.clean_log.emit(f"[还原点] 创建异常: {e}")
 
     def save_custom_rules(self):
-        self._sync() 
-        customs = [t for t in self.targets if t[5]]
+        self._sync()
+        with self._targets_lock:
+            customs = [t for t in self.targets if t[5]]
         path = self.window().custom_rules_path
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
             payload = [serialize_rule_entry(t) for t in customs]
             payload = [t for t in payload if t is not None]
-            with open(path, 'w', encoding='utf-8') as f: json.dump(payload, f, ensure_ascii=False, indent=2)
+            write_json_file_atomic(path, payload, ensure_ascii=False, indent=2)
         except Exception as e:
             log_background_error("保存自定义规则失败", e)
 
@@ -2645,7 +2777,8 @@ class CleanPage(ScrollArea):
             if tp == "glob" and not pattern:
                 InfoBar.error("错误", "glob 规则必须填写匹配模式", parent=self.window()); return
             new_rule = (nm, pa, tp, en, nt, is_c, pattern)
-            self.targets.append(new_rule)
+            with self._targets_lock:
+                self.targets.append(new_rule)
             self.reload_table()
             self.save_custom_rules()
             InfoBar.success("成功", f"规则 '{nm}' 已添加！", parent=self.window())
@@ -2710,10 +2843,11 @@ class CleanPage(ScrollArea):
         del_key_set = set(deletable_keys)
 
         # 先删数据源，避免行号变化导致错删
-        for i in range(len(self.targets) - 1, -1, -1):
-            nm, pa, tp, _, _, is_c, pattern = parse_rule_entry(self.targets[i])
-            if (nm, pa, tp, is_c, pattern) in del_key_set:
-                self.targets.pop(i)
+        with self._targets_lock:
+            for i in range(len(self.targets) - 1, -1, -1):
+                nm, pa, tp, _, _, is_c, pattern = parse_rule_entry(self.targets[i])
+                if (nm, pa, tp, is_c, pattern) in del_key_set:
+                    self.targets.pop(i)
 
         if deleted_builtin_now:
             deleted_keys = getattr(self.window(), "deleted_builtin_rule_keys", set())
@@ -2741,7 +2875,7 @@ class CleanPage(ScrollArea):
         if path:
             payload = [serialize_rule_entry(t) for t in customs]
             payload = [t for t in payload if t is not None]
-            with open(path, 'w', encoding='utf-8') as f: json.dump(payload, f, ensure_ascii=False, indent=2)
+            write_json_file_atomic(path, payload, ensure_ascii=False, indent=2)
             InfoBar.success("导出成功", f"规则已保存至: {path}", parent=self.window())
 
     def import_rules_from_path(self, path, source_name="规则集"):
@@ -2753,7 +2887,9 @@ class CleanPage(ScrollArea):
                 rules = json.load(f)
             added = 0
             skipped = 0
-            existing_keys = {make_rule_key(t[0], t[1], t[2], t[6] if len(t) >= 7 else "") for t in self.targets}
+            with self._targets_lock:
+                existing_keys = {make_rule_key(t[0], t[1], t[2], t[6] if len(t) >= 7 else "") for t in self.targets}
+            to_add = []
             for r_data in rules:
                 parsed = parse_rule_entry(r_data, force_custom=True)
                 if not parsed:
@@ -2763,10 +2899,12 @@ class CleanPage(ScrollArea):
                 if rule_key in existing_keys:
                     skipped += 1
                     continue
-                nm, pa, tp, en, nt, is_custom, pattern = parsed
                 existing_keys.add(rule_key)
-                self.targets.append(parsed)
+                to_add.append(parsed)
                 added += 1
+            if to_add:
+                with self._targets_lock:
+                    self.targets.extend(to_add)
             if added > 0:
                 self.reload_table()
                 self.save_custom_rules()
@@ -2783,9 +2921,10 @@ class CleanPage(ScrollArea):
             return False
 
     def apply_estimate(self, idx, size_val):
-        if not (0 <= idx < len(self.targets)):
-            return
-        entry = self.targets[idx]
+        with self._targets_lock:
+            if not (0 <= idx < len(self.targets)):
+                return
+            entry = self.targets[idx]
         self.estimated_sizes[self._rule_cache_key(entry)] = size_val
         if hasattr(self, "cb_sort") and self.cb_sort.currentIndex() == 3:
             self.reload_table()
@@ -2818,7 +2957,8 @@ class CleanPage(ScrollArea):
         
     def _est_w(self):
         t0 = time.time()
-        its=[(i,t) for i,t in enumerate(self.targets) if t[3]]
+        with self._targets_lock:
+            its=[(i,t) for i,t in enumerate(self.targets) if t[3]]
         if not its:
             self.sig.clean_done.emit(f"估算失败：未勾选任何项目")
             return
@@ -2901,7 +3041,9 @@ class CleanPage(ScrollArea):
     
     def _cln_w(self):
         t0 = time.time()
-        import fnmatch; pm=self.chk_perm.isChecked(); sel=[parse_rule_entry(t) for t in self.targets if t[3]]
+        import fnmatch; pm=self.chk_perm.isChecked()
+        with self._targets_lock:
+            sel=[parse_rule_entry(t) for t in self.targets if t[3]]
         sel=[t for t in sel if t]
         if not sel: return
         
@@ -2943,11 +3085,18 @@ class LeftoversDialog(MessageBoxBase):
         self.install_dir = install_dir
         self.uninst_reg = uninst_reg
         self.leftovers = {"files": [], "regs": [], "services": [], "tasks": []}
+        self.risk_summary = {"normal": 0, "high": 0, "blocked": 0}
         
         self.customTitle = TitleLabel(f"发现 '{app_name}' 的残留痕迹")
         setFont(self.customTitle, 16, QFont.Weight.Bold)
         self.viewLayout.addWidget(self.customTitle)
         self.viewLayout.addSpacing(10) 
+
+        self.tipLabel = CaptionLabel("高风险项默认未勾选，极高风险项已拦截并禁止强力删除")
+        self.tipLabel.setWordWrap(True)
+        self.tipLabel.setTextColor(QColor(128, 128, 128))
+        self.viewLayout.addWidget(self.tipLabel)
+        self.viewLayout.addSpacing(6)
         
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["残留项目", "路径"])
@@ -2960,11 +3109,62 @@ class LeftoversDialog(MessageBoxBase):
         
         self.widget.setMinimumWidth(600)
         self._scan_leftovers()
+
+    def _add_candidate(self, records, path, source="explicit"):
+        text = str(path or "").strip()
+        if not text:
+            return
+        existing = {str(item.get("path", "")).lower() for item in records if isinstance(item, dict)}
+        if text.lower() in existing:
+            return
+        records.append({"path": text, "source": source})
+
+    def _build_item_payload(self, category, raw_data, name, path, detail, source="explicit", service_kind=""):
+        protection = classify_uninstall_leftover(
+            category,
+            name=name,
+            path=path,
+            detail=detail,
+            source=source,
+            service_kind=service_kind
+        )
+        self.risk_summary[protection["tier"]] = self.risk_summary.get(protection["tier"], 0) + 1
+        return {
+            "data": raw_data,
+            "name": name,
+            "path": path,
+            "detail": detail,
+            "source": source,
+            "service_kind": service_kind,
+            "protection": protection
+        }
+
+    def _make_child_item(self, parent_item, title, detail, payload):
+        protection = payload["protection"]
+        source_text = "关键词推断" if payload.get("source") == "keyword" else ""
+        detail_parts = [detail]
+        if source_text:
+            detail_parts.append(source_text)
+        if protection["reason"]:
+            detail_parts.append(protection["reason"])
+        display_title = title
+        if protection["tier"] == "blocked":
+            display_title = f"[已拦截] {title}"
+        elif protection["tier"] == "high":
+            display_title = f"[高风险] {title}"
+
+        child = QTreeWidgetItem(parent_item, [display_title, " | ".join(part for part in detail_parts if part)])
+        if protection["tier"] == "blocked":
+            child.setFlags(child.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+        else:
+            child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            child.setCheckState(0, Qt.CheckState.Checked if protection["default_checked"] else Qt.CheckState.Unchecked)
+        return child
         
     def _scan_leftovers(self):
         paths_to_check = []
         if self.install_dir and os.path.exists(self.install_dir):
-            paths_to_check.append(self.install_dir)
+            self._add_candidate(paths_to_check, self.install_dir, source="explicit")
             
         app_data = os.environ.get("APPDATA", "")
         local_app_data = os.environ.get("LOCALAPPDATA", "")
@@ -2975,8 +3175,8 @@ class LeftoversDialog(MessageBoxBase):
             if not base: continue
             for kw in keywords:
                 guess = os.path.join(base, kw)
-                if os.path.exists(guess) and guess not in paths_to_check:
-                    paths_to_check.append(guess)
+                if os.path.exists(guess):
+                    self._add_candidate(paths_to_check, guess, source="keyword")
 
         startup_dirs = [
             os.path.join(app_data, r"Microsoft\Windows\Start Menu\Programs\Startup"),
@@ -2990,20 +3190,20 @@ class LeftoversDialog(MessageBoxBase):
                     full_path = os.path.join(startup_dir, name)
                     lower_name = name.lower()
                     if any(kw in lower_name for kw in keywords):
-                        if full_path not in paths_to_check:
-                            paths_to_check.append(full_path)
+                        self._add_candidate(paths_to_check, full_path, source="keyword")
             except Exception:
                 pass
                     
         regs_to_check = []
-        if self.uninst_reg: regs_to_check.append(self.uninst_reg)
+        if self.uninst_reg:
+            self._add_candidate(regs_to_check, self.uninst_reg, source="explicit")
         
         for base_key_str, hkey in [("HKCU\\Software", winreg.HKEY_CURRENT_USER), ("HKLM\\Software", winreg.HKEY_LOCAL_MACHINE)]:
             for kw in keywords:
                 try:
                     k = winreg.OpenKey(hkey, f"Software\\{kw}")
                     winreg.CloseKey(k)
-                    regs_to_check.append(f"{base_key_str}\\{kw}")
+                    self._add_candidate(regs_to_check, f"{base_key_str}\\{kw}", source="keyword")
                 except OSError: pass
 
         services = scan_leftover_services(keywords, self.install_dir)
@@ -3013,59 +3213,88 @@ class LeftoversDialog(MessageBoxBase):
     def _populate_tree(self, files, regs, services, tasks):
         if files:
             f_root = QTreeWidgetItem(self.tree, ["文件与文件夹"])
-            f_root.setFlags(f_root.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            f_root.setCheckState(0, Qt.CheckState.Checked)
             for f in files:
-                item_type = "文件夹" if os.path.isdir(f) else "文件"
-                child = QTreeWidgetItem(f_root, [item_type, f])
-                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                child.setCheckState(0, Qt.CheckState.Checked)
-                self.leftovers["files"].append((child, f))
+                path = str(f.get("path", "")) if isinstance(f, dict) else str(f)
+                source = str(f.get("source", "explicit")) if isinstance(f, dict) else "explicit"
+                item_type = "文件夹" if os.path.isdir(path) else "文件"
+                payload = self._build_item_payload("file", path, item_type, path, path, source=source)
+                child = self._make_child_item(f_root, item_type, path, payload)
+                self.leftovers["files"].append((child, payload))
             f_root.setExpanded(True)
             
         if regs:
             r_root = QTreeWidgetItem(self.tree, ["注册表项"])
-            r_root.setFlags(r_root.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            r_root.setCheckState(0, Qt.CheckState.Checked)
             for r in regs:
-                child = QTreeWidgetItem(r_root, ["注册表键", r])
-                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                child.setCheckState(0, Qt.CheckState.Checked)
-                self.leftovers["regs"].append((child, r))
+                path = str(r.get("path", "")) if isinstance(r, dict) else str(r)
+                source = str(r.get("source", "explicit")) if isinstance(r, dict) else "explicit"
+                payload = self._build_item_payload("reg", path, "注册表键", path, path, source=source)
+                child = self._make_child_item(r_root, "注册表键", path, payload)
+                self.leftovers["regs"].append((child, payload))
             r_root.setExpanded(True)
 
         if services:
             s_root = QTreeWidgetItem(self.tree, ["服务与驱动"])
-            s_root.setFlags(s_root.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            s_root.setCheckState(0, Qt.CheckState.Checked)
             for service in services:
                 detail = service["reg_path"]
                 if service.get("image_path"):
                     detail = f'{service.get("kind", "服务")} | {service["image_path"]}'
-                child = QTreeWidgetItem(s_root, [f'{service.get("kind", "服务")}：{service["display"]}', detail])
-                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                child.setCheckState(0, Qt.CheckState.Checked)
-                self.leftovers["services"].append((child, service))
+                payload = self._build_item_payload(
+                    "service",
+                    service,
+                    service.get("display", service.get("name", "服务")),
+                    service.get("reg_path", ""),
+                    detail,
+                    service_kind=service.get("kind", "服务")
+                )
+                child = self._make_child_item(
+                    s_root,
+                    f'{service.get("kind", "服务")}：{service["display"]}',
+                    detail,
+                    payload
+                )
+                self.leftovers["services"].append((child, payload))
             s_root.setExpanded(True)
 
         if tasks:
             t_root = QTreeWidgetItem(self.tree, ["计划任务"])
-            t_root.setFlags(t_root.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            t_root.setCheckState(0, Qt.CheckState.Checked)
             for task in tasks:
                 detail = task.get("actions") or task["full_name"]
-                child = QTreeWidgetItem(t_root, [f'计划任务：{task["name"]}', detail])
-                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                child.setCheckState(0, Qt.CheckState.Checked)
-                self.leftovers["tasks"].append((child, task))
+                payload = self._build_item_payload(
+                    "task",
+                    task,
+                    task.get("name", "计划任务"),
+                    task.get("full_name", ""),
+                    detail
+                )
+                child = self._make_child_item(t_root, f'计划任务：{task["name"]}', detail, payload)
+                self.leftovers["tasks"].append((child, payload))
             t_root.setExpanded(True)
 
     def get_selected_items(self):
+        selected_high = 0
+
+        def _collect(key):
+            nonlocal selected_high
+            results = []
+            for item, payload in self.leftovers[key]:
+                if item.checkState(0) != Qt.CheckState.Checked:
+                    continue
+                if payload["protection"]["tier"] == "high":
+                    selected_high += 1
+                results.append(payload["data"])
+            return results
+
         return {
-            "files": [path for item, path in self.leftovers["files"] if item.checkState(0) == Qt.CheckState.Checked],
-            "regs": [path for item, path in self.leftovers["regs"] if item.checkState(0) == Qt.CheckState.Checked],
-            "services": [service for item, service in self.leftovers["services"] if item.checkState(0) == Qt.CheckState.Checked],
-            "tasks": [task for item, task in self.leftovers["tasks"] if item.checkState(0) == Qt.CheckState.Checked]
+            "files": _collect("files"),
+            "regs": _collect("regs"),
+            "services": _collect("services"),
+            "tasks": _collect("tasks"),
+            "summary": {
+                "normal": self.risk_summary.get("normal", 0),
+                "high": self.risk_summary.get("high", 0),
+                "blocked": self.risk_summary.get("blocked", 0),
+                "selected_high": selected_high
+            }
         }
 
 class UninstallPage(ScrollArea):
@@ -3245,9 +3474,17 @@ class UninstallPage(ScrollArea):
         if not risky_items:
             return True
 
+        critical_items = [item for item in risky_items if item.get("risk_kind") == "critical"]
         system_items = [item for item in risky_items if item.get("risk_kind") == "system"]
-        impact_items = [item for item in risky_items if item.get("risk_kind") != "system"]
+        impact_items = [item for item in risky_items if item.get("risk_kind") not in {"system", "critical"}]
         lines = ["本次勾选项目中包含高风险卸载项"]
+
+        if critical_items:
+            lines.append("")
+            lines.append(f"极高风险组件：{len(critical_items)} 项")
+            lines.extend(f"- {item['name']}" for item in critical_items[:5])
+            if len(critical_items) > 5:
+                lines.append(f"- 另有 {len(critical_items) - 5} 项未展开")
 
         if system_items:
             lines.append("")
@@ -3266,6 +3503,24 @@ class UninstallPage(ScrollArea):
         lines.append("")
         lines.append(f"继续{action_text}可能导致驱动、运行库、浏览器内核、安全防护或其他依赖组件异常是否继续？")
         return MessageBox("风险提示", "\n".join(lines), self.window()).exec()
+
+    def _confirm_leftover_protection_summary(self, app_name, picked):
+        summary = picked.get("summary", {}) if isinstance(picked, dict) else {}
+        selected_high = int(summary.get("selected_high", 0) or 0)
+        blocked = int(summary.get("blocked", 0) or 0)
+        if selected_high <= 0 and blocked <= 0:
+            return True
+
+        lines = [f"'{app_name}' 的残留项中包含受保护内容"]
+        if selected_high > 0:
+            lines.append("")
+            lines.append(f"- 你手动勾选了 {selected_high} 个高风险残留项")
+        if blocked > 0:
+            lines.append("")
+            lines.append(f"- 另有 {blocked} 个极高风险残留项已被拦截，不会进入强力删除")
+        lines.append("")
+        lines.append("继续仅会删除你当前勾选的项目。是否继续？")
+        return MessageBox("分级保护确认", "\n".join(lines), self.window()).exec()
 
     def do_std_uninstall(self):
         data = self._get_checked_rows_data()
@@ -3376,6 +3631,21 @@ class UninstallPage(ScrollArea):
         data = self._get_checked_rows_data()
         if not data:
             self.sig.uninst_log.emit("请先勾选目标软件！"); return
+        blocked_apps = [item for item in data if item.get("risk_kind") == "critical"]
+        if blocked_apps:
+            names = "\n".join(f"- {item['name']}" for item in blocked_apps[:8])
+            if len(blocked_apps) > 8:
+                names += f"\n- 另有 {len(blocked_apps) - 8} 项未展开"
+            MessageBox(
+                "已拦截",
+                "以下项目疑似 BitLocker、TPM 或磁盘加密关键组件，已禁止强力卸载：\n\n"
+                f"{names}\n\n如需处理，请优先使用标准卸载，并确认已备份恢复密钥。",
+                self.window()
+            ).exec()
+            self.sig.uninst_log.emit(f"[分级保护] 已拦截 {len(blocked_apps)} 个极高风险强力卸载项")
+            data = [item for item in data if item.get("risk_kind") != "critical"]
+            if not data:
+                return
         if not self._confirm_risky_selection(data, "强力卸载"):
             self.sig.uninst_log.emit("已取消高风险强力卸载操作")
             return
@@ -3387,6 +3657,9 @@ class UninstallPage(ScrollArea):
             r = item["row"]; nm = item["name"]; pub = item["publisher"]; loc = item["location"]; reg = item["reg"]
             picked = self._pick_leftovers(nm, pub, loc, reg)
             if picked is None:
+                continue
+            if not self._confirm_leftover_protection_summary(nm, picked):
+                self.sig.uninst_log.emit(f"[分级保护] 已取消 {nm} 的高风险残留强力清理")
                 continue
             del_files = picked["files"]; del_regs = picked["regs"]
             del_services = picked["services"]; del_tasks = picked["tasks"]
@@ -3439,33 +3712,80 @@ class UninstallPage(ScrollArea):
         lf = lambda s: self.sig.uninst_log.emit(s)
         services = services or []
         tasks = tasks or []
-        
-        # 1. 第一步：猎杀后台进程，解除文件死锁
-        for f in files:
-            # 只有是文件夹时才尝试扫进程（通常 files 里包含了主安装目录）
-            if os.path.isdir(f):
-                kill_app_processes(f, lf)
-                time.sleep(0.5) # 给系统一点时间释放文件句柄
 
-        # 2. 第二步：删除服务与计划任务
+        stats = {
+            "services": {"label": "服务", "ok": 0, "fail": 0, "total": len(services)},
+            "tasks": {"label": "计划任务", "ok": 0, "fail": 0, "total": len(tasks)},
+            "regs": {"label": "注册表", "ok": 0, "fail": 0, "total": len(regs)},
+            "files": {"label": "文件/目录", "ok": 0, "fail": 0, "total": len(files)},
+        }
+        kill_targets = [f for f in files if os.path.isdir(f)]
+        current_stage = "准备"
+
+        def _build_summary(cancelled=False):
+            parts = []
+            for key in ("services", "tasks", "regs", "files"):
+                item = stats[key]
+                parts.append(f"{item['label']} 成功 {item['ok']}/{item['total']}，失败 {item['fail']}")
+            prefix = "强力清理已取消" if cancelled else "强力清理完成"
+            suffix = f"，中断于{current_stage}" if cancelled else ""
+            return f"{prefix}：{'；'.join(parts)}{suffix}，耗时 {time.time()-t0:.1f} 秒"
+
+        def _check_stop():
+            if self.stop.is_set():
+                self.sig.uninst_done.emit(_build_summary(cancelled=True))
+                return True
+            return False
+
+        if _check_stop():
+            return
+
+        current_stage = "进程解除锁定"
+        for install_dir in kill_targets:
+            if _check_stop():
+                return
+            kill_app_processes(install_dir, lf)
+            time.sleep(0.5)
+
+        current_stage = "服务删除"
         for service in services:
-            delete_service_entry(service.get("name", ""), service.get("reg_path", ""), lf)
-        for task in tasks:
-            delete_scheduled_task(task.get("full_name", ""), lf)
-
-        # 3. 第三步：强力粉碎注册表 (调用原生 reg delete)
-        for r in regs:
-            # 这里的 r 格式是 "HKLM\Software\xxx"
-            force_delete_registry(r, lf)
-            
-        # 4. 第四步：强制摧毁残留文件与目录
-        for f in files:
-            if delete_path(f, True, lf): 
-                self.sig.uninst_log.emit(f"[强删文件] 成功移除: {f}")
+            if _check_stop():
+                return
+            if delete_service_entry(service.get("name", ""), service.get("reg_path", ""), lf):
+                stats["services"]["ok"] += 1
             else:
-                self.sig.uninst_log.emit(f"[强删文件] 失败(可能仍有驱动级锁定): {f}")
-            
-        self.sig.uninst_done.emit(f"强力清理完成，耗时 {time.time()-t0:.1f} 秒")
+                stats["services"]["fail"] += 1
+
+        current_stage = "计划任务删除"
+        for task in tasks:
+            if _check_stop():
+                return
+            if delete_scheduled_task(task.get("full_name", ""), lf):
+                stats["tasks"]["ok"] += 1
+            else:
+                stats["tasks"]["fail"] += 1
+
+        current_stage = "注册表删除"
+        for reg_path in regs:
+            if _check_stop():
+                return
+            if force_delete_registry(reg_path, lf):
+                stats["regs"]["ok"] += 1
+            else:
+                stats["regs"]["fail"] += 1
+
+        current_stage = "文件删除"
+        for file_path in files:
+            if _check_stop():
+                return
+            if delete_path(file_path, True, lf):
+                stats["files"]["ok"] += 1
+                self.sig.uninst_log.emit(f"[强删文件] 成功移除: {file_path}")
+            else:
+                stats["files"]["fail"] += 1
+                self.sig.uninst_log.emit(f"[强删文件] 失败(可能仍有驱动级锁定): {file_path}")
+
+        self.sig.uninst_done.emit(_build_summary(cancelled=False))
 
 class BigFilePage(ScrollArea):
     def __init__(self, sig, stop, parent=None):
@@ -4292,14 +4612,16 @@ class MainWindow(FluentWindow):
                 log_background_error("加载排序与勾选状态失败", e)
                 
         self.clean_stop = threading.Event(); self.uninstall_stop = threading.Event(); self.big_stop = threading.Event(); self.more_stop = threading.Event(); self.sig = Sig()
-        self.pg_clean = CleanPage(self.sig, self.targets, self.clean_stop, self)
+        self._targets_lock = threading.Lock()
+        self.pg_clean = CleanPage(self.sig, self.targets, self.clean_stop, self._targets_lock, self)
         self.pg_rule_store = RuleStorePage(self, self)
         self.pg_big = BigFilePage(self.sig, self.big_stop, self)
         self.pg_uninstall = UninstallPage(self.sig, self.uninstall_stop, self)
         self.pg_more = MoreCleanPage(self.sig, self.more_stop, self)
         self.pg_setting = SettingPage(self, self)
+        self._update_lock = threading.Lock()
         self._update_checking = False
-        
+
         self._init_nav(); self._init_win(); self._conn()
         threading.Thread(target=self._async_detect, daemon=True).start()
         QTimer.singleShot(2000, lambda: self.check_updates(manual=False))
@@ -4324,14 +4646,13 @@ class MainWindow(FluentWindow):
 
     def _save_config_locator(self):
         try:
-            with open(self.config_locator_path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "config_dir": self.config_dir,
-                    "skip_legacy_migration": self.skip_legacy_migration,
-                    "legacy_migration_acknowledged": self.legacy_migration_acknowledged
-                }, f, ensure_ascii=False, indent=2)
-        except:
-            pass
+            write_json_file_atomic(self.config_locator_path, {
+                "config_dir": self.config_dir,
+                "skip_legacy_migration": self.skip_legacy_migration,
+                "legacy_migration_acknowledged": self.legacy_migration_acknowledged
+            }, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log_background_error("保存配置定位文件失败", e)
 
     def _legacy_config_paths(self):
         base = self.legacy_config_dir
@@ -4440,11 +4761,10 @@ class MainWindow(FluentWindow):
     def save_order_state(self):
         try:
             self.pg_clean._sync()
-            order = [t[0] for t in self.targets]
-            states = {t[0]: t[3] for t in self.targets}
-            os.makedirs(self.config_dir, exist_ok=True)
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump({"order": order, "states": states}, f, ensure_ascii=False, indent=2)
+            with self._targets_lock:
+                order = [t[0] for t in self.targets]
+                states = {t[0]: t[3] for t in self.targets}
+            write_json_file_atomic(self.config_path, {"order": order, "states": states}, ensure_ascii=False, indent=2)
         except Exception as e:
             log_background_error("保存排序状态失败", e)
 
@@ -4496,9 +4816,7 @@ class MainWindow(FluentWindow):
 
     def save_global_settings(self):
         try:
-            os.makedirs(self.config_dir, exist_ok=True)
-            with open(self.global_settings_path, "w", encoding="utf-8") as f:
-                json.dump(self.global_settings, f, ensure_ascii=False, indent=2)
+            write_json_file_atomic(self.global_settings_path, self.global_settings, ensure_ascii=False, indent=2)
         except Exception as e:
             log_background_error("保存全局设置失败", e)
 
@@ -4547,11 +4865,7 @@ class MainWindow(FluentWindow):
             return False, "导出路径不能为空"
         try:
             target = os.path.abspath(os.path.expandvars(path))
-            parent = os.path.dirname(target)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(target, "w", encoding="utf-8") as f:
-                f.write(self.build_export_log_text())
+            write_text_file_atomic(target, self.build_export_log_text(), encoding="utf-8")
             append_session_log_line(f"[{time.strftime('%H:%M:%S')}] [日志导出] {target}")
             return True, ""
         except Exception as e:
@@ -4614,11 +4928,12 @@ class MainWindow(FluentWindow):
         threads, dtype = get_scan_threads_cached("C"); self.sig.disk_ready.emit(dtype, threads)
 
     def check_updates(self, manual=False):
-        if self._update_checking:
-            if manual:
-                InfoBar.warning("请稍候", "正在检查更新，请稍后再试", parent=self)
-            return
-        self._update_checking = True
+        with self._update_lock:
+            if self._update_checking:
+                if manual:
+                    InfoBar.warning("请稍候", "正在检查更新，请稍后再试", parent=self)
+                return
+            self._update_checking = True
         threading.Thread(target=self._check_update_worker, args=(manual,), daemon=True).start()
 
     def _get_latest_update(self):
@@ -4684,7 +4999,8 @@ class MainWindow(FluentWindow):
             if manual:
                 self.sig.update_status.emit("error", "检查失败", f"无法获取更新信息: {e}")
         finally:
-            self._update_checking = False
+            with self._update_lock:
+                self._update_checking = False
 
     def _show_update_dialog(self, version, url, changelog):
         if MessageBox(f"发现新版本 v{version}", f"更新内容：\n{changelog}\n\n是否立即前往下载？", self.window()).exec() and url: webbrowser.open(url)
