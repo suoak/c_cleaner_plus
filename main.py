@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-C盘强力清理工具 v0.4.5-alpha02
+C盘强力清理工具 v0.4.6
 PySide6 + PySide6-Fluent-Widgets (Fluent2 UI)
 包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式等
 """
@@ -36,7 +36,7 @@ from qfluentwidgets.common.router import qrouter
 # ══════════════════════════════════════════════════════════
 #  版本与更新配置
 # ══════════════════════════════════════════════════════════
-CURRENT_VERSION = "0.4.5-alpha02"
+CURRENT_VERSION = "0.4.6"
 UPDATE_JSON_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/update.json"
 APP_SCHEDULED_TASK_PREFIX = "C盘强力清理工具 - "
 APP_AUTOSTART_TASK_NAME = "C盘强力清理工具 开机自启"
@@ -1465,10 +1465,57 @@ def detect_disk_type(drive_letter="C"):
     try:
         ps_script = f"""
 $partition = Get-Partition -DriveLetter {drive_letter} -ErrorAction SilentlyContinue
-if ($partition) {{
-    $disk = Get-PhysicalDisk | Where-Object {{ $_.DeviceId -eq $partition.DiskNumber }}
-    if ($disk) {{ $disk.MediaType }} else {{ "Unknown" }}
-}} else {{ "Unknown" }}
+if (-not $partition) {{
+    "Unknown"
+    exit
+}}
+
+$disk = Get-Disk -Number $partition.DiskNumber -ErrorAction SilentlyContinue
+if ($disk) {{
+    if ($disk.MediaType) {{
+        $disk.MediaType
+        exit
+    }}
+    if ($disk.BusType -and $disk.BusType.ToString() -match 'NVMe') {{
+        "SSD"
+        exit
+    }}
+    if ($disk.FriendlyName -and $disk.FriendlyName -match 'SSD|NVMe|Solid') {{
+        "SSD"
+        exit
+    }}
+    if ($disk.Model -and $disk.Model -match 'SSD|NVMe|Solid') {{
+        "SSD"
+        exit
+    }}
+}}
+
+$cim = Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue | Where-Object {{ $_.Index -eq $partition.DiskNumber }}
+if ($cim) {{
+    if ($cim.Model -and $cim.Model -match 'SSD|NVMe|Solid') {{
+        "SSD"
+        exit
+    }}
+    if ($cim.MediaType -and $cim.MediaType -match 'Fixed hard disk') {{
+        "HDD"
+        exit
+    }}
+}}
+
+if ($disk -and $disk.BusType) {{
+    if ($disk.BusType.ToString() -match 'SATA|SAS|RAID') {{
+        "HDD"
+        exit
+    }}
+}}
+
+$physical = Get-PhysicalDisk -ErrorAction SilentlyContinue | Where-Object {{ $_.FriendlyName -eq $disk.FriendlyName -or $_.FriendlyName -eq $cim.Model }}
+if ($physical -and $physical.MediaType) {{
+    $physical.MediaType
+    exit
+}}
+
+"Unknown"
 """
         r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
             capture_output=True, text=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
@@ -1487,7 +1534,9 @@ def get_scan_threads_cached(drive_letter="C"):
     try:
         drives = _load_scan_cache()
         cache = drives.get(drive_letter, {})
-        if time.time() - cache.get("ts", 0) < 86400:
+        dtype = cache.get("dtype", "Unknown")
+        ttl = 300 if dtype == "Unknown" else 86400
+        if time.time() - cache.get("ts", 0) < ttl:
             return cache.get("threads", 4), cache.get("dtype", "Unknown")
     except Exception as e:
         log_background_error("读取线程缓存", e)
@@ -2742,8 +2791,8 @@ def _run_scheduled_empty_dirs(permanent_delete, log):
                 elif item.is_dir(follow_symlinks=False) and item.path not in empty_set:
                     is_empty = False
                     break
-                if is_empty:
-                    empty_set.add(d)
+            if is_empty:
+                empty_set.add(d)
         except Exception as e:
             log_sampled_background_error("定时任务空文件夹扫描", e)
     if not empty_set:
@@ -3567,12 +3616,19 @@ class RulePackManagerDialog(MessageBoxBase):
             InfoBar.warning("部分完成", f"已清理 {ok} 个，失败 {fl} 个", parent=self.main_win)
 
 class RuleStorePage(ScrollArea):
+    itemsLoaded = Signal(object, object)
+
     def __init__(self, main_win, parent=None):
         super().__init__(parent)
         self.main_win = main_win
         self.selected_item = None
         self.store_items = []
         self._content_initialized = False
+        self._content_init_pending = False
+        self._loading_items = False
+        self._refresh_requested = False
+        self._initial_load_requested = False
+        self._detail_initialized = False
 
         self.view = QWidget()
         self.setWidget(self.view)
@@ -3603,18 +3659,46 @@ class RuleStorePage(ScrollArea):
         self.root.addWidget(self.content_holder, 1)
 
         self.tbl = None
+        self._content_row = None
+        self._right_panel = None
         self.lbl_name = None
         self.lbl_meta = None
         self.lbl_detail = None
         self.btn_import = None
+        self.loading_card = CardWidget(self.view)
+        loading_layout = QVBoxLayout(self.loading_card)
+        loading_layout.setContentsMargins(16, 16, 16, 16)
+        loading_layout.setSpacing(6)
+        self.loading = CaptionLabel("规则商店已打开，正在准备列表...")
+        self.loading.setTextColor(QColor(128, 128, 128))
+        self.loading.setWordWrap(True)
+        self.loading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        loading_layout.addStretch(1)
+        loading_layout.addWidget(self.loading)
+        loading_layout.addStretch(1)
+        self.loading_card.setMinimumHeight(140)
+        self.content_layout.addWidget(self.loading_card)
+        self.itemsLoaded.connect(self._apply_loaded_items)
 
-    def _ensure_content(self):
+    def _ensure_content(self, immediate=False, auto_load=True):
         if self._content_initialized:
+            if auto_load and not self._initial_load_requested:
+                self._initial_load_requested = True
+                QTimer.singleShot(0, self._load_items)
             return
+        if self._content_init_pending and not immediate:
+            return
+        if not immediate:
+            self._content_init_pending = True
+            QTimer.singleShot(0, lambda: self._ensure_content(immediate=True, auto_load=auto_load))
+            return
+        self._content_init_pending = False
         self._content_initialized = True
+        self.loading_card.hide()
 
         content = QHBoxLayout()
         content.setSpacing(12)
+        self._content_row = content
         self.content_layout.addLayout(content, 1)
 
         left = CardWidget(self.view)
@@ -3640,9 +3724,34 @@ class RuleStorePage(ScrollArea):
         self.tbl.itemDoubleClicked.connect(lambda _: self._confirm_selection())
         left_layout.addWidget(self.tbl, 1)
         content.addWidget(left, 3)
+        self._right_panel = CardWidget(self.view)
+        right_layout = QVBoxLayout(self._right_panel)
+        right_layout.setContentsMargins(16, 16, 16, 16)
+        right_layout.setSpacing(10)
+        right_layout.addWidget(StrongBodyLabel("规则详情"))
+        placeholder = CaptionLabel("选择左侧规则包后再显示详情")
+        placeholder.setWordWrap(True)
+        placeholder.setTextColor(QColor(128, 128, 128))
+        right_layout.addStretch()
+        right_layout.addWidget(placeholder)
+        right_layout.addStretch()
+        content.addWidget(self._right_panel, 2)
 
-        right = CardWidget(self.view)
-        right_layout = QVBoxLayout(right)
+        QTimer.singleShot(0, self._load_items)
+
+    def showEvent(self, event):
+        self._ensure_content(immediate=False, auto_load=True)
+        super().showEvent(event)
+
+    def prepare_lightweight(self):
+        self._ensure_content(immediate=True, auto_load=False)
+
+    def _ensure_detail_panel(self):
+        if self._detail_initialized or self._right_panel is None:
+            return
+        old_panel = self._right_panel
+        self._right_panel = CardWidget(self.view)
+        right_layout = QVBoxLayout(self._right_panel)
         right_layout.setContentsMargins(16, 16, 16, 16)
         right_layout.setSpacing(10)
         right_layout.addWidget(StrongBodyLabel("规则详情"))
@@ -3665,17 +3774,38 @@ class RuleStorePage(ScrollArea):
         self.btn_import = PrimaryPushButton(FIF.DOCUMENT, "下载并导入")
         self.btn_import.clicked.connect(self._confirm_selection)
         right_layout.addWidget(self.btn_import)
-        content.addWidget(right, 2)
 
-        self._load_items()
-
-    def showEvent(self, event):
-        self._ensure_content()
-        super().showEvent(event)
+        if self._content_row is not None:
+            self._content_row.replaceWidget(old_panel, self._right_panel)
+        old_panel.hide()
+        old_panel.deleteLater()
+        self._detail_initialized = True
 
     def _load_items(self, notify=False):
-        self._ensure_content()
-        items, err = load_rule_store_items()
+        self._ensure_content(immediate=True)
+        if self._loading_items:
+            self._refresh_requested = self._refresh_requested or notify
+            return
+        self._loading_items = True
+        self._refresh_requested = False
+        self.btn_refresh.setEnabled(False)
+        self.btn_manage.setEnabled(False)
+        if self.tbl is not None:
+            self.tbl.setEnabled(False)
+        self.desc.setText("正在刷新规则包列表...")
+        threading.Thread(target=self._load_items_worker, args=(notify,), daemon=True).start()
+
+    def _load_items_worker(self, notify):
+        items = []
+        err = None
+        try:
+            items, err = load_rule_store_items()
+        except Exception as e:
+            err = str(e)
+        self.itemsLoaded.emit((items, notify), err)
+
+    def _apply_loaded_items(self, payload, err):
+        items, notify = payload if isinstance(payload, tuple) else ([], False)
         if not err:
             self.store_items = items
         self.desc.setText(
@@ -3692,9 +3822,12 @@ class RuleStorePage(ScrollArea):
             self.tbl.setItem(row, 3, QTableWidgetItem(item["filename"]))
         if self.tbl.rowCount() > 0:
             self.tbl.selectRow(0)
-            self._sync_detail()
-        else:
-            self._sync_detail()
+        self._sync_detail()
+
+        self._loading_items = False
+        self.btn_refresh.setEnabled(True)
+        self.btn_manage.setEnabled(True)
+        self.tbl.setEnabled(True)
 
         if notify:
             if err:
@@ -3702,17 +3835,23 @@ class RuleStorePage(ScrollArea):
             else:
                 InfoBar.success("刷新成功", f"已加载 {len(items)} 个规则包", parent=self.main_win)
 
+        if self._refresh_requested:
+            pending_notify = self._refresh_requested
+            self._refresh_requested = False
+            QTimer.singleShot(0, lambda n=pending_notify: self._load_items(notify=n))
+
     def _refresh_items(self):
-        self._ensure_content()
+        self._ensure_content(immediate=True)
         self._load_items(notify=True)
 
     def _open_pack_manager(self):
-        self._ensure_content()
+        self._ensure_content(immediate=True)
         dialog = RulePackManagerDialog(self.main_win, self.store_items, self)
         dialog.exec()
 
     def _sync_detail(self):
-        self._ensure_content()
+        self._ensure_content(immediate=True)
+        self._ensure_detail_panel()
         row = self.tbl.currentRow()
         if row < 0:
             self.selected_item = None
@@ -3732,7 +3871,8 @@ class RuleStorePage(ScrollArea):
         self.btn_import.setEnabled(True)
 
     def _confirm_selection(self):
-        self._ensure_content()
+        self._ensure_content(immediate=True)
+        self._ensure_detail_panel()
         if not self.selected_item:
             InfoBar.warning("提示", "请先选择一个规则包", parent=self.main_win)
             return
@@ -3875,11 +4015,18 @@ class ScheduledUninstallDialog(MessageBoxBase):
         return rows
 
 class SchedulePage(ScrollArea):
+    tasksLoaded = Signal(object, object)
+
     def __init__(self, main_win, parent=None):
         super().__init__(parent)
         self.main_win = main_win
         self.uninstall_items = []
         self._content_initialized = False
+        self._content_init_pending = False
+        self._heavy_content_initialized = False
+        self._heavy_content_pending = False
+        self._task_loading = False
+        self._refresh_requested = False
         self.view = QWidget()
         self.setWidget(self.view)
         self.setWidgetResizable(True)
@@ -3923,10 +4070,24 @@ class SchedulePage(ScrollArea):
         self.sp_uninstall_timeout = None
         self.tbl = None
         self.log = None
+        self.loading = CaptionLabel("正在准备定时任务内容...")
+        self.loading.setTextColor(QColor(128, 128, 128))
+        self.loading.setWordWrap(True)
+        self.content_layout.addWidget(self.loading)
+        self.tasksLoaded.connect(self._apply_task_list)
 
-    def _ensure_content(self):
+    def _ensure_content(self, immediate=False, skip_heavy=False):
         if self._content_initialized:
+            if not skip_heavy:
+                self._ensure_heavy_content(immediate=immediate)
             return
+        if self._content_init_pending and not immediate:
+            return
+        if not immediate:
+            self._content_init_pending = True
+            QTimer.singleShot(0, lambda: self._ensure_content(immediate=True, skip_heavy=skip_heavy))
+            return
+        self._content_init_pending = False
         self._content_initialized = True
 
         form = CardWidget(self.view)
@@ -4050,6 +4211,27 @@ class SchedulePage(ScrollArea):
         form_layout.addLayout(row3)
         self.content_layout.addWidget(form)
 
+        self._sync_trigger_widgets()
+        self._sync_uninstall_widgets()
+        if not skip_heavy:
+            self._ensure_heavy_content(immediate=False)
+
+    def prepare_lightweight(self):
+        self._ensure_content(immediate=True, skip_heavy=True)
+
+    def _ensure_heavy_content(self, immediate=False):
+        if self._heavy_content_initialized:
+            return
+        if self._heavy_content_pending and not immediate:
+            return
+        if not immediate:
+            self._heavy_content_pending = True
+            QTimer.singleShot(30, lambda: self._ensure_heavy_content(immediate=True))
+            return
+        self._heavy_content_pending = False
+        self._heavy_content_initialized = True
+        self.loading.hide()
+
         self.tbl = TableWidget()
         self.tbl.setColumnCount(6)
         self.tbl.setHorizontalHeaderLabels(["任务名称", "触发方式", "下次运行", "上次运行", "状态", "结果"])
@@ -4072,14 +4254,11 @@ class SchedulePage(ScrollArea):
         self.log.setFont(QFont("Consolas", 9))
         self.log.setPlaceholderText("日志...")
         self.content_layout.addWidget(self.log)
-
-        self._sync_trigger_widgets()
-        self._sync_uninstall_widgets()
-        self.refresh_tasks()
+        QTimer.singleShot(0, self.refresh_tasks)
 
     def showEvent(self, event):
-        self._ensure_content()
         super().showEvent(event)
+        self._ensure_content(immediate=False)
 
     def _append_log(self, text):
         if self.log is None:
@@ -4140,7 +4319,7 @@ class SchedulePage(ScrollArea):
         self._append_log(f"已选择 {len(self.uninstall_items)} 个应用用于定时标准卸载")
 
     def _selected_task_name(self):
-        self._ensure_content()
+        self._ensure_heavy_content(immediate=True)
         row = self.tbl.currentRow()
         if row < 0:
             return ""
@@ -4151,12 +4330,32 @@ class SchedulePage(ScrollArea):
         return str(full_name or item.text()).strip()
 
     def refresh_tasks(self):
-        self._ensure_content()
+        self._ensure_heavy_content(immediate=True)
+        if self._task_loading:
+            self._refresh_requested = True
+            return
+        self._task_loading = True
+        self._refresh_requested = False
+        self._append_log("正在刷新定时任务列表...")
+        threading.Thread(target=self._refresh_tasks_worker, daemon=True).start()
+
+    def _refresh_tasks_worker(self):
+        items = []
+        err = None
         try:
             items = list_scheduled_app_tasks()
         except Exception as e:
-            self._append_log(f"刷新定时任务失败: {e}")
-            InfoBar.error("刷新失败", str(e), parent=self.main_win)
+            err = str(e)
+        self.tasksLoaded.emit(items, err)
+
+    def _apply_task_list(self, items, err):
+        if self.tbl is None:
+            self._task_loading = False
+            return
+        if err:
+            self._append_log(f"刷新定时任务失败: {err}")
+            InfoBar.error("刷新失败", err, parent=self.main_win)
+            self._task_loading = False
             return
 
         self.tbl.setRowCount(len(items))
@@ -4176,9 +4375,13 @@ class SchedulePage(ScrollArea):
             self.tbl.setItem(row, 5, QTableWidgetItem(result_text))
 
         self._append_log(f"已加载 {len(items)} 个定时任务")
+        self._task_loading = False
+        if self._refresh_requested:
+            self._refresh_requested = False
+            QTimer.singleShot(0, self.refresh_tasks)
 
     def _create_task(self):
-        self._ensure_content()
+        self._ensure_content(immediate=True)
         raw_name = self.name_input.text().strip() or "自动常规清理"
         schedule_index = self.cb_schedule.currentIndex()
         schedule_type = {0: "daily", 1: "weekly", 2: "hourly", 3: "minute", 4: "logon"}.get(schedule_index, "daily")
@@ -4233,7 +4436,7 @@ class SchedulePage(ScrollArea):
             InfoBar.error("创建失败", msg, parent=self.main_win)
 
     def _delete_selected_task(self):
-        self._ensure_content()
+        self._ensure_heavy_content(immediate=True)
         task_name = self._selected_task_name()
         if not task_name:
             InfoBar.warning("提示", "请先选择一个定时任务", parent=self.main_win)
@@ -4251,7 +4454,7 @@ class SchedulePage(ScrollArea):
             InfoBar.error("删除失败", msg, parent=self.main_win)
 
     def _run_selected_task(self):
-        self._ensure_content()
+        self._ensure_heavy_content(immediate=True)
         task_name = self._selected_task_name()
         if not task_name:
             InfoBar.warning("提示", "请先选择一个定时任务", parent=self.main_win)
@@ -5438,8 +5641,15 @@ class LeftoversDialog(MessageBoxBase):
 
 class UninstallPage(ScrollArea):
     def __init__(self, sig, stop, parent=None):
+        self.tbl = None
+        self.tbl_model = None
+        self.footer = None
         super().__init__(parent); self.sig=sig; self.stop=stop
         self._display_overflow_count = 0
+        self._heavy_content_initialized = False
+        self._heavy_content_pending = False
+        self._footer_initialized = False
+        self._footer_pending = False
         self.view=QWidget(); self.setWidget(self.view); self.setWidgetResizable(True); self.setObjectName("uninstallPage"); self.enableTransparentBackground()
         v=QVBoxLayout(self.view); v.setContentsMargins(28,12,28,20); v.setSpacing(8)
         v.addLayout(make_title_row(FIF.APPLICATION, "应用强力卸载"))
@@ -5464,6 +5674,38 @@ class UninstallPage(ScrollArea):
         search_layout.addWidget(self.sp_timeout)
         search_layout.addStretch()
         v.addLayout(search_layout)
+
+        self._heavy_holder = QWidget(self.view)
+        self._heavy_layout = QVBoxLayout(self._heavy_holder)
+        self._heavy_layout.setContentsMargins(0, 0, 0, 0)
+        self._heavy_layout.setSpacing(8)
+        v.addWidget(self._heavy_holder, 1)
+        self.loading = CaptionLabel("正在准备卸载页面内容...")
+        self.loading.setTextColor(QColor(128, 128, 128))
+        self.loading.setWordWrap(True)
+        self._heavy_layout.addWidget(self.loading)
+
+    def _ensure_content(self, immediate=False, skip_footer=False):
+        self._ensure_heavy_content(immediate=immediate, skip_footer=skip_footer)
+
+    def prepare_lightweight(self):
+        self._ensure_content(immediate=True, skip_footer=True)
+
+    def _ensure_heavy_content(self, immediate=False, skip_footer=False):
+        if self._heavy_content_initialized:
+            if not skip_footer:
+                self._ensure_footer_content(immediate=immediate)
+            return
+        if self._heavy_content_pending and not immediate:
+            return
+        if not immediate:
+            self._heavy_content_pending = True
+            QTimer.singleShot(25, lambda: self._ensure_heavy_content(immediate=True, skip_footer=skip_footer))
+            return
+
+        self._heavy_content_pending = False
+        self._heavy_content_initialized = True
+        self.loading.hide()
 
         self.tbl = TableView()
         self.tbl_model = UninstallTableModel(self.tbl)
@@ -5493,30 +5735,58 @@ class UninstallPage(ScrollArea):
         self.tbl.verticalScrollBar().valueChanged.connect(lambda _: self._update_visible_icon_rows())
         self.tbl.verticalScrollBar().rangeChanged.connect(lambda *_: self._update_visible_icon_rows())
         self.tbl.viewport().installEventFilter(self)
-        v.addWidget(self.tbl, 1)
+        self._heavy_layout.addWidget(self.tbl, 1)
 
         br=QHBoxLayout(); br.setSpacing(8)
         b1=PushButton(FIF.SYNC,"刷新列表"); b1.setFixedHeight(30); b1.clicked.connect(self.do_scan); br.addWidget(b1)
         br.addStretch()
         b2=PushButton(FIF.REMOVE,"标准卸载"); b2.setFixedHeight(30); b2.clicked.connect(self.do_std_uninstall); br.addWidget(b2)
         b3=PrimaryPushButton(FIF.DELETE,"强力卸载"); b3.setFixedHeight(30); b3.clicked.connect(self.do_force_uninstall); br.addWidget(b3)
-        v.addLayout(br)
+        self._heavy_layout.addLayout(br)
+
+        if not skip_footer:
+            self._ensure_footer_content(immediate=immediate)
+
+    def _ensure_footer_content(self, immediate=False):
+        if self._footer_initialized:
+            return
+        if self._footer_pending and not immediate:
+            return
+        if not immediate:
+            self._footer_pending = True
+            QTimer.singleShot(20, lambda: self._ensure_footer_content(immediate=True))
+            return
+        self._footer_pending = False
+        self._footer_initialized = True
 
         self.footer = PageFooterWidget()
-        v.addWidget(self.footer)
+        self._heavy_layout.addWidget(self.footer)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._ensure_content(immediate=False)
 
     @property
-    def pb(self): return self.footer.pb
+    def pb(self):
+        self._ensure_footer_content(immediate=True)
+        return self.footer.pb
     @property
-    def sl(self): return self.footer.sl
+    def sl(self):
+        self._ensure_footer_content(immediate=True)
+        return self.footer.sl
     @property
-    def log(self): return self.footer.log
+    def log(self):
+        self._ensure_footer_content(immediate=True)
+        return self.footer.log
 
     def reset_result_view(self):
+        self._ensure_heavy_content(immediate=True)
         self._display_overflow_count = 0
         self.tbl_model.clear()
 
     def _filter_table(self, text):
+        if self.tbl_model is None or self.tbl is None:
+            return
         search_str = text.lower()
         for r in range(self.tbl_model.rowCount()):
             row = self.tbl_model.row_at(r) or {}
@@ -5526,6 +5796,7 @@ class UninstallPage(ScrollArea):
             self.tbl.setRowHidden(r, not match)
 
     def add_result_rows(self, rows):
+        self._ensure_heavy_content(immediate=True)
         if not rows:
             return
         remaining = max(0, UNINSTALL_TABLE_MAX_ROWS - self.tbl_model.rowCount())
@@ -5542,11 +5813,13 @@ class UninstallPage(ScrollArea):
         return
 
     def eventFilter(self, watched, event):
-        if hasattr(self, "tbl") and self.tbl is not None and watched is self.tbl.viewport() and event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+        if self.tbl is not None and watched is self.tbl.viewport() and event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
             QTimer.singleShot(0, self._update_visible_icon_rows)
         return super().eventFilter(watched, event)
 
     def _update_visible_icon_rows(self):
+        if self.tbl is None or self.tbl_model is None:
+            return
         if self.tbl_model.rowCount() <= 0:
             self.tbl_model.set_visible_row_range(0, -1)
             return
@@ -5557,6 +5830,7 @@ class UninstallPage(ScrollArea):
         self.tbl_model.set_visible_row_range(first_row, last_row)
 
     def _show_context_menu(self, pos):
+        self._ensure_heavy_content(immediate=True)
         idx = self.tbl.indexAt(pos)
         if not idx.isValid():
             return
@@ -5592,6 +5866,7 @@ class UninstallPage(ScrollArea):
             m.deleteLater()
 
     def do_scan(self):
+        self._ensure_heavy_content(immediate=True)
         self.stop.clear(); self.sig.uninst_clr.emit(); self.sig.uninst_log.emit("开始扫描系统软件列表...")
         threading.Thread(target=self._scan_w, daemon=True).start()
 
@@ -5626,6 +5901,7 @@ class UninstallPage(ScrollArea):
         self.sig.uninst_done.emit(f"成功扫描出 {total_found} 个软件（用户 {user_count}，系统 {system_count}），耗时 {time.time()-t0:.1f} 秒")
 
     def _get_checked_rows_data(self):
+        self._ensure_heavy_content(immediate=True)
         rows = []
         for r in range(self.tbl_model.rowCount()):
             row = self.tbl_model.row_at(r)
@@ -5960,8 +6236,13 @@ class UninstallPage(ScrollArea):
 class BigFilePage(ScrollArea):
     def __init__(self, sig, stop, parent=None):
         super().__init__(parent); self.sig=sig; self.stop=stop
+        self._content_initialized = False
+        self._content_init_pending = False
+        self._heavy_content_initialized = False
+        self._heavy_content_pending = False
         self.view=QWidget(); self.setWidget(self.view); self.setWidgetResizable(True); self.setObjectName("bigFilePage"); self.enableTransparentBackground()
         v=QVBoxLayout(self.view); v.setContentsMargins(28,12,28,20); v.setSpacing(8)
+        self.root = v
         self._disk_threads = 4; self._disk_type = "检测中..."; self.lbl_disk = CaptionLabel("类型：检测中...  线程：4")
         self.lbl_disk.setTextColor(QColor(128, 128, 128))
         self.lbl_disk.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -5989,6 +6270,61 @@ class BigFilePage(ScrollArea):
         self.chk_skip_special=CheckBox("跳过系统/虚拟机大文件"); self.chk_skip_special.setChecked(True); self.chk_skip_special.setToolTip("跳过分页/休眠/内存转储以及常见虚拟机磁盘镜像")
         pr.addWidget(self.chk_skip_special)
         self.chk_perm=CheckBox("永久删除"); self.chk_perm.setChecked(True); pr.addWidget(self.chk_perm); pr.addStretch(); v.addLayout(pr)
+        self.content_holder = QWidget(self.view)
+        self.content_layout = QVBoxLayout(self.content_holder)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_layout.setSpacing(8)
+        v.addWidget(self.content_holder, 1)
+        self.loading = CaptionLabel("正在准备大文件扫描内容...")
+        self.loading.setTextColor(QColor(128, 128, 128))
+        self.loading.setWordWrap(True)
+        self.content_layout.addWidget(self.loading)
+
+        self.tbl = None
+        self.tbl_model = None
+        self.btn_sel_all = None
+        self.footer = None
+        self._footer_initialized = False
+        self._footer_pending = False
+
+    def _ensure_content(self, immediate=False, skip_heavy=False):
+        if self._content_initialized:
+            if not skip_heavy:
+                self._ensure_heavy_content(immediate=immediate)
+            return
+        if self._content_init_pending and not immediate:
+            return
+        if not immediate:
+            self._content_init_pending = True
+            QTimer.singleShot(0, lambda: self._finish_content_init(skip_heavy=skip_heavy))
+            return
+        self._content_init_pending = False
+        self._content_initialized = True
+        if not skip_heavy:
+            self._ensure_heavy_content(immediate=immediate)
+
+    def _finish_content_init(self, skip_heavy=False):
+        self._content_init_pending = False
+        self._content_initialized = True
+        if not skip_heavy:
+            self._ensure_heavy_content(immediate=False)
+
+    def prepare_lightweight(self):
+        self._ensure_content(immediate=True, skip_heavy=True)
+
+    def _ensure_heavy_content(self, immediate=False):
+        if self._heavy_content_initialized:
+            self._ensure_footer_content(immediate=immediate)
+            return
+        if self._heavy_content_pending and not immediate:
+            return
+        if not immediate:
+            self._heavy_content_pending = True
+            QTimer.singleShot(25, lambda: self._ensure_heavy_content(immediate=True))
+            return
+        self._heavy_content_pending = False
+        self._heavy_content_initialized = True
+        self.loading.hide()
 
         self.tbl = TableView()
         self.tbl_model = BigFileTableModel(self.tbl)
@@ -6010,34 +6346,66 @@ class BigFilePage(ScrollArea):
         self.tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tbl_model.dataChanged.connect(self._on_model_data_changed)
         self.tbl.customContextMenuRequested.connect(self._show_context_menu)
-        v.addWidget(self.tbl, 1)
+        self.content_layout.addWidget(self.tbl, 1)
 
         br=QHBoxLayout(); br.setSpacing(8)
         b1=PrimaryPushButton(FIF.SEARCH,"扫描"); b1.setFixedHeight(30); b1.clicked.connect(self.do_scan); br.addWidget(b1)
-        
+
         self.btn_sel_all = PushButton(FIF.ACCEPT, "全选"); self.btn_sel_all.setFixedHeight(30)
         self.btn_sel_all.clicked.connect(self.toggle_sel_all); br.addWidget(self.btn_sel_all)
 
         b3=PushButton(FIF.DELETE,"删除已勾选"); b3.setFixedHeight(30); b3.clicked.connect(self.do_del); br.addWidget(b3)
         b4=PushButton(FIF.CANCEL,"停止"); b4.setFixedHeight(30); b4.clicked.connect(self._stop_current); br.addWidget(b4)
-        br.addStretch(); v.addLayout(br)
+        br.addStretch(); self.content_layout.addLayout(br)
+        self._sync_select_all_button()
+        self._ensure_footer_content(immediate=immediate)
 
+    def _ensure_footer_content(self, immediate=False):
+        if self._footer_initialized:
+            return
+        if self._footer_pending and not immediate:
+            return
+        if not immediate:
+            self._footer_pending = True
+            QTimer.singleShot(20, lambda: self._ensure_footer_content(immediate=True))
+            return
+        self._footer_pending = False
+        self._footer_initialized = True
         self.footer = PageFooterWidget()
-        v.addWidget(self.footer)
+        self.content_layout.addWidget(self.footer)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._ensure_content(immediate=False)
+        host = self.window()
+        if self._disk_type in {"检测中...", "Unknown"} and hasattr(host, "_request_disk_detect"):
+            try:
+                host._request_disk_detect(force=True)
+            except Exception:
+                pass
 
     @property
-    def pb(self): return self.footer.pb
+    def pb(self):
+        self._ensure_footer_content(immediate=True)
+        return self.footer.pb
     @property
-    def sl(self): return self.footer.sl
+    def sl(self):
+        self._ensure_footer_content(immediate=True)
+        return self.footer.sl
     @property
-    def log(self): return self.footer.log
+    def log(self):
+        self._ensure_footer_content(immediate=True)
+        return self.footer.log
 
     def toggle_sel_all(self):
+        self._ensure_heavy_content(immediate=True)
         all_checked = self.tbl_model.all_checked()
         self.tbl_model.set_all_checked(not all_checked)
         self._sync_select_all_button()
 
     def _sync_select_all_button(self):
+        if self.btn_sel_all is None or self.tbl_model is None:
+            return
         if self.tbl_model.all_checked():
             self.btn_sel_all.setText("取消全选")
             self.btn_sel_all.setIcon(FIF.CLOSE)
@@ -6055,6 +6423,7 @@ class BigFilePage(ScrollArea):
         self.stop.set()
 
     def _apply_sort(self, _=None):
+        self._ensure_heavy_content(immediate=True)
         mode = self.cb_sort.currentIndex() if hasattr(self, "cb_sort") else 0
         if mode == 0:
             return
@@ -6063,15 +6432,18 @@ class BigFilePage(ScrollArea):
         self.tbl_model.sort(column, order)
 
     def reset_result_view(self):
+        self._ensure_heavy_content(immediate=True)
         self.tbl_model.clear()
         self._sync_select_all_button()
 
     def add_result_rows(self, rows):
+        self._ensure_heavy_content(immediate=True)
         self.tbl_model.add_rows(rows)
         self._apply_sort()
         self._sync_select_all_button()
 
     def _show_context_menu(self, pos):
+        self._ensure_heavy_content(immediate=True)
         idx = self.tbl.indexAt(pos)
         if not idx.isValid():
             return
@@ -6104,6 +6476,7 @@ class BigFilePage(ScrollArea):
             m.deleteLater()
 
     def do_scan(self):
+        self._ensure_heavy_content(immediate=True)
         self.stop.clear(); self.btn_sel_all.setText("全选"); self.btn_sel_all.setIcon(FIF.ACCEPT)
         threading.Thread(target=self._scan_w,daemon=True).start()
 
@@ -6150,6 +6523,7 @@ class BigFilePage(ScrollArea):
         self.sig.big_done.emit("success", f"扫描完成，找到 {shown_count} 条，耗时 {time.time()-t0:.1f} 秒")
 
     def do_del(self):
+        self._ensure_heavy_content(immediate=True)
         paths = self.tbl_model.checked_paths()
         if not paths: return
         pm=self.chk_perm.isChecked()
@@ -6172,8 +6546,15 @@ class MoreCleanPage(ScrollArea):
     def __init__(self, sig, stop, parent=None):
         super().__init__(parent); self.sig=sig; self.stop=stop
         self._display_overflow_count = 0
+        self._content_initialized = False
+        self._content_init_pending = False
+        self._heavy_content_initialized = False
+        self._heavy_content_pending = False
+        self._footer_initialized = False
+        self._footer_pending = False
         self.view=QWidget(); self.setWidget(self.view); self.setWidgetResizable(True); self.setObjectName("moreCleanPage"); self.enableTransparentBackground()
         v=QVBoxLayout(self.view); v.setContentsMargins(28,12,28,20); v.setSpacing(8)
+        self.root = v
         v.addLayout(make_title_row(FIF.MORE, "更多清理"))
 
         dl = QHBoxLayout(); dl.setSpacing(10)
@@ -6195,6 +6576,67 @@ class MoreCleanPage(ScrollArea):
         pr.addWidget(self.btn_restore_assoc)
         v.addLayout(pr)
         self._on_mode_change()
+        self.content_holder = QWidget(self.view)
+        self.content_layout = QVBoxLayout(self.content_holder)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_layout.setSpacing(8)
+        v.addWidget(self.content_holder, 1)
+        self.loading_card = CardWidget(self.view)
+        loading_layout = QVBoxLayout(self.loading_card)
+        loading_layout.setContentsMargins(16, 16, 16, 16)
+        loading_layout.setSpacing(6)
+        self.loading = CaptionLabel("更多清理已打开，正在准备结果区...")
+        self.loading.setTextColor(QColor(128, 128, 128))
+        self.loading.setWordWrap(True)
+        self.loading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        loading_layout.addStretch(1)
+        loading_layout.addWidget(self.loading)
+        loading_layout.addStretch(1)
+        self.loading_card.setMinimumHeight(140)
+        self.content_layout.addWidget(self.loading_card)
+
+        self.tbl = None
+        self.tbl_model = None
+        self.btn_sel_all = None
+        self.footer = None
+
+    def _ensure_content(self, immediate=False, skip_heavy=False):
+        if self._content_initialized:
+            if not skip_heavy:
+                self._ensure_heavy_content(immediate=immediate)
+            return
+        if self._content_init_pending and not immediate:
+            return
+        if not immediate:
+            self._content_init_pending = True
+            QTimer.singleShot(0, lambda: self._finish_content_init(skip_heavy=skip_heavy))
+            return
+        self._content_init_pending = False
+        self._content_initialized = True
+        if not skip_heavy:
+            self._ensure_heavy_content(immediate=immediate)
+
+    def _finish_content_init(self, skip_heavy=False):
+        self._content_init_pending = False
+        self._content_initialized = True
+        if not skip_heavy:
+            self._ensure_heavy_content(immediate=False)
+
+    def prepare_lightweight(self):
+        self._ensure_content(immediate=True, skip_heavy=True)
+
+    def _ensure_heavy_content(self, immediate=False):
+        if self._heavy_content_initialized:
+            return
+        if self._heavy_content_pending and not immediate:
+            return
+        if not immediate:
+            self._heavy_content_pending = True
+            QTimer.singleShot(25, lambda: self._ensure_heavy_content(immediate=True))
+            return
+        self._heavy_content_pending = False
+        self._heavy_content_initialized = True
+        self.loading_card.hide()
 
         self.tbl = TableView()
         self.tbl_model = MoreCleanTableModel(self.tbl)
@@ -6218,38 +6660,65 @@ class MoreCleanPage(ScrollArea):
         self.tbl_model.dataChanged.connect(self._on_model_data_changed)
         self.tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tbl.customContextMenuRequested.connect(self._show_context_menu)
-        v.addWidget(self.tbl, 1)
+        self.content_layout.addWidget(self.tbl, 1)
 
         br=QHBoxLayout(); br.setSpacing(8)
         b1=PrimaryPushButton(FIF.SEARCH,"开始扫描"); b1.setFixedHeight(30); b1.clicked.connect(self.do_scan); br.addWidget(b1)
-        
+
         self.btn_sel_all = PushButton(FIF.ACCEPT, "全选"); self.btn_sel_all.setFixedHeight(30)
         self.btn_sel_all.clicked.connect(self.toggle_sel_all); br.addWidget(self.btn_sel_all)
 
         b2=PushButton(FIF.DELETE,"清理已勾选"); b2.setFixedHeight(30); b2.clicked.connect(self.do_del); br.addWidget(b2)
-        b3=PushButton(FIF.CANCEL,"停止"); b3.setFixedHeight(30); b3.clicked.connect(self._stop_current); br.addWidget(b3); br.addStretch(); v.addLayout(br)
+        b3=PushButton(FIF.CANCEL,"停止"); b3.setFixedHeight(30); b3.clicked.connect(self._stop_current); br.addWidget(b3); br.addStretch(); self.content_layout.addLayout(br)
+        self._sync_select_all_button()
+        self._ensure_footer_content(immediate=immediate)
 
+    def _ensure_footer_content(self, immediate=False):
+        if self._footer_initialized:
+            return
+        if self._footer_pending and not immediate:
+            return
+        if not immediate:
+            self._footer_pending = True
+            QTimer.singleShot(20, lambda: self._ensure_footer_content(immediate=True))
+            return
+        self._footer_pending = False
+        self._footer_initialized = True
         self.footer = PageFooterWidget()
-        v.addWidget(self.footer)
+        self.content_layout.addWidget(self.footer)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._ensure_content(immediate=False)
 
     @property
-    def pb(self): return self.footer.pb
+    def pb(self):
+        self._ensure_footer_content(immediate=True)
+        return self.footer.pb
     @property
-    def sl(self): return self.footer.sl
+    def sl(self):
+        self._ensure_footer_content(immediate=True)
+        return self.footer.sl
     @property
-    def log(self): return self.footer.log
+    def log(self):
+        self._ensure_footer_content(immediate=True)
+        return self.footer.log
 
     def reset_result_view(self):
+        self._ensure_heavy_content(immediate=True)
         self._display_overflow_count = 0
         self.tbl_model.clear()
         self._sync_select_all_button()
 
     def toggle_sel_all(self):
+        self._ensure_heavy_content(immediate=True)
         all_checked = self.tbl_model.all_checked()
         self.tbl_model.set_all_checked(not all_checked)
         self._sync_select_all_button()
 
     def _sync_select_all_button(self):
+        if self.btn_sel_all is None or self.tbl_model is None:
+            return
         if self.tbl_model.all_checked():
             self.btn_sel_all.setText("取消全选")
             self.btn_sel_all.setIcon(FIF.CLOSE)
@@ -6262,6 +6731,7 @@ class MoreCleanPage(ScrollArea):
             self._sync_select_all_button()
 
     def add_result_rows(self, rows):
+        self._ensure_heavy_content(immediate=True)
         if not rows:
             return
         remaining = max(0, MORE_TABLE_MAX_ROWS - self.tbl_model.rowCount())
@@ -6274,6 +6744,7 @@ class MoreCleanPage(ScrollArea):
         self._sync_select_all_button()
 
     def _show_context_menu(self, pos):
+        self._ensure_heavy_content(immediate=True)
         idx = self.tbl.indexAt(pos)
         if not idx.isValid():
             return
@@ -6329,13 +6800,15 @@ class MoreCleanPage(ScrollArea):
             self.sig.more_add_batch.emit(rows[:])
 
     def do_scan(self):
+        self._ensure_heavy_content(immediate=True)
         idx = self.cb_mode.currentIndex(); roots = self.drive_sel.selected_drives()
         if idx not in (3, 4) and not roots: self.sig.more_done.emit("错误：未选择磁盘"); return
         self.stop.clear(); self.sig.more_clr.emit(); self.sig.more_log.emit(f"开始 {self.cb_mode.currentText()}...")
         
         self._sync_select_all_button()
 
-        workers = self.window().pg_big._disk_threads if hasattr(self.window(), 'pg_big') else 4
+        big_page = getattr(self.window(), "pg_big", None)
+        workers = big_page._disk_threads if big_page is not None else 4
 
         if idx == 0: threading.Thread(target=self._scan_duplicates, args=(roots, workers), daemon=True).start()
         elif idx == 1: threading.Thread(target=self._scan_empty_dirs, args=(roots, workers), daemon=True).start()
@@ -6895,6 +7368,9 @@ class MoreCleanPage(ScrollArea):
 #  主窗口
 # ══════════════════════════════════════════════════════════
 class MainWindow(MSFluentWindow):
+    PAGE_SWITCH_DURATION_MS = 180
+    LAZY_PAGE_SWITCH_DURATION_MS = 130
+
     def __init__(self):
         super().__init__()
 
@@ -6985,25 +7461,30 @@ class MainWindow(MSFluentWindow):
         self.pg_rule_store = None
         self.pg_big = None
         self.pg_uninstall = None
-        self.pg_schedule = None
+        self.pg_schedule = SchedulePage(self, self)
         self.pg_more = None
         self.pg_setting = SettingPage(self, self)
         self._lazy_route_keys = {
             "pg_rule_store": "ruleStorePage",
-            "pg_schedule": "schedulePage",
             "pg_big": "bigFilePage",
             "pg_uninstall": "uninstallPage",
             "pg_more": "moreCleanPage",
         }
         self._lazy_page_factories = {
             "pg_rule_store": lambda: RuleStorePage(self, self),
-            "pg_schedule": lambda: SchedulePage(self, self),
             "pg_big": lambda: BigFilePage(self.sig, self.big_stop, self),
             "pg_uninstall": lambda: UninstallPage(self.sig, self.uninstall_stop, self),
             "pg_more": lambda: MoreCleanPage(self.sig, self.more_stop, self),
         }
         self._lazy_placeholders = {}
+        self._lazy_switch_pending = set()
+        self._lazy_target_route = ""
+        self._lazy_switch_token = 0
         self._detected_disk_info = None
+        self._disk_detect_lock = threading.Lock()
+        self._disk_detecting = False
+        self._last_forced_disk_detect_ts = 0.0
+        self._prewarm_attr_names = ("pg_rule_store", "pg_uninstall", "pg_big", "pg_more")
         self._update_lock = threading.Lock()
         self._update_checking = False
         self._nav_connected = False
@@ -7022,8 +7503,10 @@ class MainWindow(MSFluentWindow):
         self.apply_theme_mode()
 
         self._init_nav(); self._init_win(); self._conn()
-        threading.Thread(target=self._async_detect, daemon=True).start()
+        self._request_disk_detect(force=False)
         QTimer.singleShot(2000, lambda: self.check_updates(manual=False))
+        QTimer.singleShot(900, self._warmup_schedule_page)
+        QTimer.singleShot(1500, self._schedule_lazy_prewarm)
         self._pending_legacy_migration = self._should_offer_legacy_migration()
         if self._pending_legacy_migration:
             QTimer.singleShot(800, self._prompt_legacy_config_migration)
@@ -7398,16 +7881,35 @@ class MainWindow(MSFluentWindow):
         setattr(self, attr_name, page)
 
         placeholder = self._lazy_placeholders.get(attr_name)
-        if placeholder is not None:
+        current_widget = self.stackedWidget.currentWidget()
+        placeholder_is_current = placeholder is not None and current_widget is placeholder
+
+        if self.stackedWidget.indexOf(page) < 0:
+            self.stackedWidget.addWidget(page)
+
+        if placeholder_is_current:
+            self.stackedWidget.setCurrentWidget(page)
+
+        def _discard_placeholder(ph):
+            if ph is None:
+                return
+            idx = self.stackedWidget.indexOf(ph)
+            if idx >= 0:
+                self.stackedWidget.removeWidget(ph)
+            ph.hide()
+            ph.deleteLater()
+
+        if placeholder is not None and not placeholder_is_current:
             idx = self.stackedWidget.indexOf(placeholder)
             if idx >= 0:
                 self.stackedWidget.removeWidget(placeholder)
             placeholder.hide()
             placeholder.deleteLater()
             self._lazy_placeholders.pop(attr_name, None)
+        elif placeholder is not None and placeholder_is_current:
+            self._lazy_placeholders.pop(attr_name, None)
+            QTimer.singleShot(0, lambda ph=placeholder: _discard_placeholder(ph))
 
-        if self.stackedWidget.indexOf(page) < 0:
-            self.stackedWidget.addWidget(page)
         if attr_name == "pg_big" and self._detected_disk_info and hasattr(page, "_on_disk_ready"):
             try:
                 page._on_disk_ready(*self._detected_disk_info)
@@ -7419,12 +7921,33 @@ class MainWindow(MSFluentWindow):
     def _register_nav_items(self):
         self._add_nav_page(self.pg_clean, FIF.BROOM, "常规清理")
         self._add_lazy_nav_page("pg_rule_store", FIF.DOCUMENT, "规则商店")
-        self._add_lazy_nav_page("pg_schedule", FIF.SYNC, "定时任务")
+        self._add_nav_page(self.pg_schedule, FIF.SYNC, "定时任务")
         self._add_lazy_nav_page("pg_big", FIF.ZOOM, "大文件扫描")
         self._add_lazy_nav_page("pg_uninstall", FIF.APPLICATION, "应用强力卸载")
         self._add_lazy_nav_page("pg_more", FIF.MORE, "更多清理")
         self._add_nav_page(self.pg_setting, FIF.SETTING, "设置", position=NavigationItemPosition.BOTTOM)
         self._add_nav_action("about", FIF.INFO, "关于", self._about, position=NavigationItemPosition.BOTTOM)
+
+    def _schedule_lazy_prewarm(self):
+        self._prewarm_lazy_pages(0)
+
+    def _warmup_schedule_page(self):
+        try:
+            self.pg_schedule.prepare_lightweight()
+        except Exception as e:
+            log_sampled_background_error("预热定时任务页面失败", e)
+
+    def _prewarm_lazy_pages(self, index):
+        if index >= len(self._prewarm_attr_names):
+            return
+        attr_name = self._prewarm_attr_names[index]
+        try:
+            page = self._ensure_lazy_page(attr_name)
+            if hasattr(page, "prepare_lightweight"):
+                page.prepare_lightweight()
+        except Exception as e:
+            log_sampled_background_error(f"预热页面失败:{attr_name}", e)
+        QTimer.singleShot(420, lambda idx=index + 1: self._prewarm_lazy_pages(idx))
 
     def _add_nav_page(self, interface, icon, text, position=NavigationItemPosition.TOP, isTransparent=False):
         if not interface.objectName():
@@ -7435,7 +7958,10 @@ class MainWindow(MSFluentWindow):
             self.stackedWidget.addWidget(interface)
 
         route_key = interface.objectName()
-        on_click = lambda checked=False, page=interface: self.switchTo(page)
+        def on_click(checked=False, page=interface):
+            self._lazy_target_route = ""
+            self._lazy_switch_token += 1
+            self._switch_interface(page, self.PAGE_SWITCH_DURATION_MS)
 
         if isinstance(self.navigationInterface, NavigationBar):
             self.navigationInterface.addItem(
@@ -7475,7 +8001,7 @@ class MainWindow(MSFluentWindow):
             self.stackedWidget.addWidget(interface)
 
         route_key = interface.objectName()
-        on_click = lambda checked=False, name=attr_name: self.switchTo(self._ensure_lazy_page(name))
+        on_click = lambda checked=False, name=attr_name: self._switch_to_lazy_page(name)
 
         if isinstance(self.navigationInterface, NavigationBar):
             self.navigationInterface.addItem(
@@ -7504,6 +8030,93 @@ class MainWindow(MSFluentWindow):
             qrouter.setDefaultRouteKey(self.stackedWidget, route_key)
 
         self._updateStackedBackground()
+
+    def _switch_to_lazy_page(self, attr_name):
+        self._lazy_switch_token += 1
+        switch_token = self._lazy_switch_token
+        page = getattr(self, attr_name, None)
+        if page is not None:
+            self._lazy_target_route = ""
+            if switch_token != self._lazy_switch_token:
+                return
+            self._switch_interface(page, self.LAZY_PAGE_SWITCH_DURATION_MS)
+            QTimer.singleShot(15, lambda p=page, token=switch_token: self._activate_lazy_page_content(p, token))
+            return
+
+        placeholder = self._get_lazy_placeholder(attr_name)
+        self._lazy_target_route = placeholder.objectName()
+        try:
+            self.navigationInterface.setCurrentItem(placeholder.objectName())
+        except Exception:
+            pass
+        if attr_name in self._lazy_switch_pending:
+            return
+
+        self._lazy_switch_pending.add(attr_name)
+
+        def build_and_switch():
+            try:
+                if switch_token != self._lazy_switch_token:
+                    return
+                page = self._ensure_lazy_page(attr_name)
+                if switch_token != self._lazy_switch_token:
+                    return
+                self._switch_interface(page, self.LAZY_PAGE_SWITCH_DURATION_MS)
+                QTimer.singleShot(15, lambda p=page, token=switch_token: self._activate_lazy_page_content(p, token))
+            except Exception as e:
+                log_background_error(f"切换延迟页面失败:{attr_name}", e)
+                self._lazy_target_route = ""
+            finally:
+                self._lazy_switch_pending.discard(attr_name)
+
+        QTimer.singleShot(0, build_and_switch)
+
+    def _activate_lazy_page_content(self, page, switch_token, retry=0):
+        if page is None or switch_token != self._lazy_switch_token:
+            return
+        if self.stackedWidget.currentWidget() is not page:
+            if retry < 6:
+                QTimer.singleShot(20, lambda p=page, token=switch_token, r=retry + 1: self._activate_lazy_page_content(p, token, r))
+            return
+        ensure_fn = getattr(page, "_ensure_content", None)
+        if not callable(ensure_fn):
+            return
+        try:
+            ensure_fn(immediate=False)
+        except TypeError:
+            ensure_fn()
+
+    def _onCurrentInterfaceChanged(self, index):
+        widget = self.stackedWidget.widget(index)
+        if widget is None:
+            return
+
+        route_key = widget.objectName()
+        pending_route = getattr(self, "_lazy_target_route", "")
+        if pending_route:
+            if route_key != pending_route:
+                self._updateStackedBackground()
+                return
+            self._lazy_target_route = ""
+
+        self.navigationInterface.setCurrentItem(route_key)
+        qrouter.push(self.stackedWidget, route_key)
+        self._updateStackedBackground()
+
+    def _switch_interface(self, interface, duration=None):
+        if interface is None:
+            return
+        if hasattr(interface, "verticalScrollBar") and callable(getattr(interface, "verticalScrollBar")):
+            try:
+                scroll_bar = interface.verticalScrollBar()
+                if scroll_bar is not None:
+                    scroll_bar.setValue(0)
+            except Exception:
+                pass
+        self.stackedWidget.view.setCurrentWidget(interface, duration=duration or self.PAGE_SWITCH_DURATION_MS)
+
+    def switchTo(self, interface):
+        self._switch_interface(interface, self.PAGE_SWITCH_DURATION_MS)
 
     def _add_nav_action(self, route_key, icon, text, on_click, position=NavigationItemPosition.BOTTOM):
         callback = (lambda checked=False: on_click())
@@ -7580,10 +8193,38 @@ class MainWindow(MSFluentWindow):
         self._more_flush_timer.stop()
         self.pg_more.reset_result_view()
 
-    def _async_detect(self):
-        threads, dtype = get_scan_threads_cached("C")
-        self._detected_disk_info = (dtype, threads)
-        self.sig.disk_ready.emit(dtype, threads)
+    def _request_disk_detect(self, force=False):
+        try:
+            with self._disk_detect_lock:
+                if self._disk_detecting:
+                    return
+                now = time.time()
+                if force and now - self._last_forced_disk_detect_ts < 8:
+                    return
+                self._disk_detecting = True
+                if force:
+                    self._last_forced_disk_detect_ts = now
+            threading.Thread(target=self._async_detect, args=(force,), daemon=True).start()
+        except Exception as e:
+            log_sampled_background_error("请求磁盘检测失败", e)
+
+    def _async_detect(self, force=False):
+        try:
+            if force:
+                threads, dtype = get_scan_threads("C")
+                try:
+                    drives = _load_scan_cache()
+                    drives["C"] = {"threads": threads, "dtype": dtype, "ts": time.time()}
+                    _save_scan_cache(drives)
+                except Exception as e:
+                    log_sampled_background_error("更新磁盘检测缓存失败", e)
+            else:
+                threads, dtype = get_scan_threads_cached("C")
+            self._detected_disk_info = (dtype, threads)
+            self.sig.disk_ready.emit(dtype, threads)
+        finally:
+            with self._disk_detect_lock:
+                self._disk_detecting = False
 
     def check_updates(self, manual=False):
         with self._update_lock:
